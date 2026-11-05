@@ -1,0 +1,10 @@
+ABV, Full_Name
+nfe, European (excluding Finland)
+fin, Finnish
+amr, American (admixed)
+afr, African/African American
+ami, Amish
+mid, Middle Eastern
+sas, South Asian
+eas, East Asian
+asj, Ashkenazi Jewish
