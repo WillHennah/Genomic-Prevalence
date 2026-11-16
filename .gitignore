@@ -1,22 +1,71 @@
-# Data
-data/
-temp/
+# ============================================================
+# Python
+# ============================================================
 
-# Results
-results/
-
-# Python-generated files
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 
-# Jupyter temporary files
-.ipynb_checkpoints/
+# Virtual environments
+.venv/
+venv/
+env/
 
-# Environment variables / secrets
-.env
 
+# ============================================================
 # macOS
+# ============================================================
+
 .DS_Store
 
-# Python virtual environment
-.venv/
+
+# ============================================================
+# VS Code / Jupyter
+# ============================================================
+
+.vscode/
+.ipynb_checkpoints/
+temp.py
+/temp
+
+# ============================================================
+# Downloaded source data
+# ============================================================
+
+variation_summary.txt
+variation_summary.txt.gz
+
+
+# ============================================================
+# Generated ClinVar data
+# ============================================================
+
+Pathogenic_Variants_temp.csv
+Pathogenic_Variants.csv
+
+
+# ============================================================
+# Generated gnomAD data
+# ============================================================
+
+Pathogenic_Variant_Frequencies_All.csv
+Summmed_Frequencies.csv
+Gene_Based_Prevalences.csv
+
+
+# ============================================================
+# Failed gnomAD query logs
+# ============================================================
+
+failed_variants_retryable.log
+failed_variants_nonretryable.log
+
+
+# ============================================================
+# Generated figures/reports
+# ============================================================
+
+carrier_prevalence_heatmaps_by_phenotype.pdf
+carrier_prevalence_heatmaps_by_gene.pdf
+homozygote_carrier_prevalence_heatmaps_by_phenotype.pdf
+homozygote_carrier_prevalence_heatmaps_by_gene.pdf
