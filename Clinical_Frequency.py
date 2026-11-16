@@ -9,6 +9,7 @@ import json
 import time
 import textwrap
 import re
+import random
 
 import seaborn as sns
 import matplotlib as mpl
@@ -23,7 +24,6 @@ from pandas import json_normalize
 # ============================================================
 
 INCLUDE_LIKELY_PATHOGENIC = False
-
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -223,20 +223,7 @@ pathovar = pathovar[
 
 pathovar = pathovar.reset_index(drop=True)
 
-
-# here
-
-
-## Additionally parse for phenotypes of interest too
-
-#pathovar = pathovar[pathovar['PhenotypeList'].str.contains('cancer|neoplasm|tumor|tumour|carcinoma|astoma|cytoma|neoplasia|cystoma|artoma', case=False, na=False)]
-
 pathovar.to_csv("Pathogenic_Variants_temp.csv", index=False)
-
-
-# In[3]:
-
-
 
 ## Create Variant List from ClinVar Data
 
@@ -246,115 +233,437 @@ pvars['variant'] = pvars['Chromosome'].astype(str) + '-' + pvars['PositionVCF'].
 pvars.to_csv("Pathogenic_Variants.csv", index=False)
 
 
-main = "17-43045711-G-GT"
+# ============================================================
+# Retrieve variant frequencies from gnomAD
+# ============================================================
 
-## Search by variant for allele frequencies from GnomAD
-### Run in background
+GNOMAD_API_URL = "https://gnomad.broadinstitute.org/api"
+GNOMAD_DATASET = "gnomad_r4"
 
-gnomadurl = "https://gnomad.broadinstitute.org/api?"
-gnomadvar= "query=%20%20%20%20%7B%0A%09%09variant(variantId%3A%20%22" + main + "%22%2C%20dataset%3A%20gnomad_r4)%20%7B%0A%20%20%20%20%20%20%20%20variant_id%0A%20%20%20%20%20%20%20%20transcript_consequences%20%7B%0A%20%20%20%20%20%20%20%20%20%20gene_symbol%0A%20%20%20%20%20%20%20%20%09gene_id%0A%20%20%20%20%20%20%20%20%20%20is_canonical%0A%20%20%20%20%20%20%20%20%20%20is_mane_select%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20%09rsid%0A%20%20%20%20%20%20%09in_silico_predictors%20%7B%0A%20%20%20%20%20%20%09%20%20id%0A%20%20%20%20%20%20%20%20%20%20value%0A%20%20%20%20%20%20%09%7D%0A%20%20%20%20%20%20%20%20genome%20%7B%0A%20%20%20%20%20%20%09%09populations%20%7B%0A%20%20%20%20%20%20%09%09%20%20id%0A%20%20%20%20%20%20%20%20%20%20%20%20ac%0A%20%20%20%20%20%20%20%20%20%20%20%20an%0A%20%20%20%20%20%20%20%20%20%20%20%20homozygote_count%0A%20%20%20%20%20%20%20%20%20%20%20%20hemizygote_count%0A%20%20%20%20%20%20%09%09%7D%0A%20%20%20%20%20%20%20%20%20%20af%0A%20%20%20%20%20%20%20%20%20%20%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20%20%20exome%20%7B%0A%20%20%20%20%20%20%20%20%20%20populations%20%7B%0A%20%20%20%20%20%20%09%09%20%20id%0A%20%20%20%20%20%20%20%20%20%20%20%20ac%0A%20%20%20%20%20%20%20%20%20%20%20%20an%0A%20%20%20%20%20%20%20%20%20%20%20%20homozygote_count%0A%20%20%20%20%20%20%20%20%20%20%20%20hemizygote_count%0A%20%20%20%20%20%20%09%09%7D%0A%20%20%20%20%20%20%20%20%20%20af%20%20%20%20%20%20%0A%09%09%09%09%7D%09%09%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%7D"
+GNOMAD_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Origin": "https://gnomad.broadinstitute.org",
+    "Referer": "https://gnomad.broadinstitute.org/",
+}
+
+GNOMAD_QUERY = """
+query VariantPopulationFrequencies(
+    $variantId: String!,
+    $dataset: DatasetId!
+) {
+    variant(
+        variantId: $variantId,
+        dataset: $dataset
+    ) {
+        variant_id
+
+        exome {
+            ac
+            an
+            af
+
+            populations {
+                id
+                ac
+                an
+            }
+        }
+
+        genome {
+            ac
+            an
+            af
+
+            populations {
+                id
+                ac
+                an
+            }
+        }
+    }
+}
+"""
+
+RETRYABLE_STATUS_CODES = {
+    429,
+    500,
+    502,
+    503,
+    504,
+}
 
 
-responsea = requests.get(gnomadurl + gnomadvar)
-gnomadvarsa = responsea.json()
-gnovarxx = gnomadvarsa.get('data')
-gnovaryy = gnovarxx.get('variant')
-gnovarzz = gnovaryy.get('exome')
-gnovarpop = gnovarzz.get('populations')
-gnomadaf = json_normalize(gnovarpop, max_level=0)
-gnomadaf = gnomadaf.convert_dtypes()
+def query_gnomad_variant(
+    variant_id,
+    session,
+    dataset=GNOMAD_DATASET,
+    max_retries=5,
+    timeout=60,
+    base_sleep=1.0,
+    jitter=0.5,
+):
 
-gnomadaf[main + "del"] = gnomadaf['ac'] / gnomadaf['an']
+    payload = {
+        "query": GNOMAD_QUERY,
+        "variables": {
+            "variantId": variant_id,
+            "dataset": dataset,
+        },
+    }
 
-gnomadafall = gnomadaf.drop(['ac', 
-                      'an', 
-                      'homozygote_count', 
-                      'hemizygote_count'], axis=1)
+    retryable_statuses = {
+        403,
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
 
-retry_statuses = [502, 503, 504]
+    for attempt in range(1, max_retries + 1):
 
-log_retryable = "failed_variants_retryable.log"
-log_nonretryable = "failed_variants_nonretryable.log"
-
-
-SNPs = pvars['variant'].unique().tolist()
-#del SNPs[15500:30985]
-#del SNPs[99:38555]
-
-for variant in SNPs:
-### Search by variant for allele frequencies
-    
-    gnomadurl = "https://gnomad.broadinstitute.org/api?"
-    gnomadvar= "query=%20%20%20%20%7B%0A%09%09variant(variantId%3A%20%22" + variant + "%22%2C%20dataset%3A%20gnomad_r4)%20%7B%0A%20%20%20%20%20%20%20%20variant_id%0A%20%20%20%20%20%20%20%20transcript_consequences%20%7B%0A%20%20%20%20%20%20%20%20%20%20gene_symbol%0A%20%20%20%20%20%20%20%20%09gene_id%0A%20%20%20%20%20%20%20%20%20%20is_canonical%0A%20%20%20%20%20%20%20%20%20%20is_mane_select%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20%09rsid%0A%20%20%20%20%20%20%09in_silico_predictors%20%7B%0A%20%20%20%20%20%20%09%20%20id%0A%20%20%20%20%20%20%20%20%20%20value%0A%20%20%20%20%20%20%09%7D%0A%20%20%20%20%20%20%20%20genome%20%7B%0A%20%20%20%20%20%20%09%09populations%20%7B%0A%20%20%20%20%20%20%09%09%20%20id%0A%20%20%20%20%20%20%20%20%20%20%20%20ac%0A%20%20%20%20%20%20%20%20%20%20%20%20an%0A%20%20%20%20%20%20%20%20%20%20%20%20homozygote_count%0A%20%20%20%20%20%20%20%20%20%20%20%20hemizygote_count%0A%20%20%20%20%20%20%09%09%7D%0A%20%20%20%20%20%20%20%20%20%20af%0A%20%20%20%20%20%20%20%20%20%20%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20%20%20exome%20%7B%0A%20%20%20%20%20%20%20%20%20%20populations%20%7B%0A%20%20%20%20%20%20%09%09%20%20id%0A%20%20%20%20%20%20%20%20%20%20%20%20ac%0A%20%20%20%20%20%20%20%20%20%20%20%20an%0A%20%20%20%20%20%20%20%20%20%20%20%20homozygote_count%0A%20%20%20%20%20%20%20%20%20%20%20%20hemizygote_count%0A%20%20%20%20%20%20%09%09%7D%0A%20%20%20%20%20%20%20%20%20%20af%20%20%20%20%20%20%0A%09%09%09%09%7D%09%09%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%7D"
-
-    max_retries = 5
-    delay = 2
-
-
-    for attempt in range(max_retries):
         try:
-            response = requests.get(gnomadurl + gnomadvar)
 
-            if response.status_code in retry_statuses:
-                raise requests.exceptions.HTTPError(f"Retryable error: {response.status_code}")
+            response = session.post(
+                GNOMAD_API_URL,
+                json=payload,
+                headers=GNOMAD_HEADERS,
+                timeout=timeout,
+            )
 
-            response.raise_for_status()
+            # ------------------------------------------
+            # Successful HTTP response
+            # ------------------------------------------
 
-            gnomadvars = response.json()
-            gnovarx = gnomadvars.get('data')
-            gnovary = gnovarx.get('variant')
-            gnovarz = gnovary.get('genome')
-            gnovarpop = gnovarz.get('populations')
+            if response.status_code == 200:
 
-            gnomadaf = json_normalize(gnovarpop, max_level=0)
-            gnomadaf = gnomadaf.convert_dtypes()
-            gnomadaf[variant] = gnomadaf['ac'] / gnomadaf['an']
-            gnomadaf = gnomadaf.drop(['ac', 'an', 'homozygote_count', 'hemizygote_count'], axis=1)
+                result = response.json()
 
-            gnomadafall = pd.merge(gnomadafall, gnomadaf, on='id', how='outer')
-            time.sleep(2)
-            break
+                # GraphQL can return HTTP 200
+                # while containing GraphQL errors.
+                if result.get("errors"):
 
-        except requests.exceptions.HTTPError as e:
-            if response.status_code in retry_statuses:
-                print(f"Retryable error ({response.status_code}) on attempt {attempt+1} for {variant}")
-                time.sleep(delay)
-                delay *= 2            
-                if attempt == max_retries - 1:
-                    with open(log_retryable, "a") as f:
-                        f.write(variant + "\n")
-                    print(f"Logged retryable failure for {variant}")
+                    error_messages = [
+                        error.get("message", str(error))
+                        for error in result["errors"]
+                    ]
+
+                    error_text = " | ".join(error_messages)
+
+                    # A valid variant query may simply not be present in gnomAD.
+                    # Treat this as a data outcome rather than an API failure.
+                    if any(
+                        "Variant not found" in message
+                        for message in error_messages
+                    ):
+                        return {
+                            "variant_id": variant_id,
+                            "status": "not_found",
+                            "data": None,
+                            "error": None,
+                        }
+
+                    return {
+                        "variant_id": variant_id,
+                        "status": "graphql_error",
+                        "data": None,
+                        "error": error_text,
+                    }
+
+                variant_data = (
+                    result
+                    .get("data", {})
+                    .get("variant")
+                )
+
+                if variant_data is None:
+
+                    return {
+                        "variant_id": variant_id,
+                        "status": "not_found",
+                        "data": None,
+                        "error": None,
+                    }
+
+                return {
+                    "variant_id": variant_id,
+                    "status": "success",
+                    "data": variant_data,
+                    "error": None,
+                }
+
+            # ------------------------------------------
+            # Cloudflare / rate limiting / server error
+            # ------------------------------------------
+
+            if response.status_code in retryable_statuses:
+
+                if attempt == max_retries:
+
+                    return {
+                        "variant_id": variant_id,
+                        "status": "request_failed",
+                        "data": None,
+                        "error": (
+                            f"HTTP {response.status_code}: "
+                            f"{response.text[:500]}"
+                        ),
+                    }
+
+                sleep_time = (
+                    base_sleep * (2 ** (attempt - 1))
+                    + random.uniform(0, jitter)
+                )
+
+                print(
+                    f"[WARN] {variant_id}: "
+                    f"gnomAD returned {response.status_code}. "
+                    f"Retrying in {sleep_time:.2f}s "
+                    f"({attempt}/{max_retries})"
+                )
+
+                time.sleep(sleep_time)
+                continue
+
+            # ------------------------------------------
+            # Non-retryable HTTP error
+            # ------------------------------------------
+
+            return {
+                "variant_id": variant_id,
+                "status": "request_failed",
+                "data": None,
+                "error": (
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:1000]}"
+                ),
+            }
+
+        except requests.exceptions.RequestException as exc:
+
+            if attempt == max_retries:
+
+                return {
+                    "variant_id": variant_id,
+                    "status": "request_failed",
+                    "data": None,
+                    "error": str(exc),
+                }
+
+            sleep_time = (
+                base_sleep * (2 ** (attempt - 1))
+                + random.uniform(0, jitter)
+            )
+
+            print(
+                f"[WARN] {variant_id}: network error. "
+                f"Retrying in {sleep_time:.2f}s."
+            )
+
+            time.sleep(sleep_time)
+
+    return {
+        "variant_id": variant_id,
+        "status": "request_failed",
+        "data": None,
+        "error": "Maximum retries exceeded",
+    }
+
+def normalise_gnomad_result(query_result):
+    """
+    Convert one successful gnomAD result into long-format rows.
+
+    One row represents one:
+        variant + dataset source + population
+    """
+
+    variant_id = query_result["variant_id"]
+    status = query_result["status"]
+
+    if status != "success":
+        return pd.DataFrame()
+
+    variant_data = query_result["data"]
+    rsid = variant_data.get("rsid")
+
+    rows = []
+
+    for source in ["exome", "genome"]:
+
+        source_data = variant_data.get(source)
+
+        if source_data is None:
+            continue
+
+        populations = source_data.get("populations") or []
+
+        for population in populations:
+
+            ac = population.get("ac")
+            an = population.get("an")
+
+            # Calculate AF ourselves from AC/AN where possible.
+            if ac is not None and an not in (None, 0):
+                af = ac / an
             else:
-                print(f"Non-retryable HTTP error for {variant}: {e}")
-                with open(log_nonretryable, "a") as f:
-                    f.write(variant + "\n")
-                time.sleep(2)
-                break
-        except Exception as e:
-#            print(f"Unexpected error for {variant}: {e}")
-            with open(log_nonretryable, "a") as f:
-                f.write(variant + "\n")
-            time.sleep(2)
-            break
+                af = pd.NA
+
+            rows.append(
+                {
+                    "variant_id": variant_id,
+                    "rsid": rsid,
+                    "source": source,
+                    "population_id": population.get("id"),
+                    "ac": ac,
+                    "an": an,
+                    "af": af,
+                    "homozygote_count": population.get(
+                        "homozygote_count"
+                    ),
+                    "hemizygote_count": population.get(
+                        "hemizygote_count"
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+# ============================================================
+# Test the updated gnomAD query on five variants
+# ============================================================
+
+all_variants = (
+    pvars["variant"]
+    .dropna()
+    .astype("string")
+    .drop_duplicates()
+    .tolist()
+)
+
+test_variants = all_variants[:5]
+
+print(f"Testing gnomAD query on {len(test_variants)} variants.")
+
+frequency_results = []
+query_log = []
+
+with requests.Session() as session:
+
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "genomic-prevalence/0.1 "
+                "(research frequency calculation)"
+            ),
+        }
+    )
+
+    for number, variant_id in enumerate(
+        test_variants,
+        start=1,
+    ):
+
+        print(
+            f"[{number}/{len(test_variants)}] "
+            f"Querying {variant_id}"
+        )
+
+        result = query_gnomad_variant(
+            variant_id=variant_id,
+            session=session,
+        )
+
+        query_log.append(
+            {
+                "variant_id": variant_id,
+                "status": result["status"],
+                "error": result["error"],
+            }
+        )
+
+        variant_frequencies = normalise_gnomad_result(result)
+
+        if not variant_frequencies.empty:
+            frequency_results.append(variant_frequencies)
+
+        # Be considerate of the public API.
+        time.sleep(1)
+
+gnomad_query_log = pd.DataFrame(query_log)
+
+if frequency_results:
+
+    gnomad_frequency_test = pd.concat(
+        frequency_results,
+        ignore_index=True,
+    )
+
+else:
+
+    gnomad_frequency_test = pd.DataFrame(
+        columns=[
+            "variant_id",
+            "rsid",
+            "source",
+            "population_id",
+            "ac",
+            "an",
+            "af",
+            "homozygote_count",
+            "hemizygote_count",
+        ]
+    )
 
 
-            
-gnomadafall = gnomadafall.drop([main +"del"], axis=1)
+print("\nQuery status:")
+print(gnomad_query_log.to_string(index=False))
 
-gnomadafally = gnomadafall.T
-gnomadafally.columns = gnomadafall.index
-gnomadafally.index.name = 'SNP_ID'
-gnomadafally = gnomadafally.reset_index()
+print("\nFrequency output:")
+print(gnomad_frequency_test.head(20).to_string(index=False))
 
-gnomadafally.columns = gnomadafally.iloc[0]
-gnomadafally = gnomadafally[1:]
+print(
+    "\nRows returned:",
+    len(gnomad_frequency_test)
+)
 
+print(
+    "Sources returned:",
+    sorted(
+        gnomad_frequency_test["source"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+)
 
-gnomadafally.to_csv("Pathogenic_Variant_Frequencies_All.csv", index=False)
+print(
+    "Population IDs returned:",
+    sorted(
+        gnomad_frequency_test["population_id"]
+        .dropna()
+        .unique()
+        .tolist()
+    )[:30]
+)
+gnomad_query_log.to_csv(
+    "gnomad_query_log_test.csv",
+    index=False,
+)
 
+gnomad_frequency_test.to_csv(
+    "gnomad_frequency_test.csv",
+    index=False,
+)
 
-# In[4]:
-
+#here
 
 pheno = pd.read_csv("Pathogenic_Variants.csv", delimiter=",")
 pheno = pheno.drop(['SomaticClinicalImpact',

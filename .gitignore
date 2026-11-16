@@ -65,7 +65,8 @@ Gene_Based_Prevalences.csv
 
 failed_variants_retryable.log
 failed_variants_nonretryable.log
-
+gnomad_query_log_test.csv
+gnomad_frequency_test.csv
 
 # ============================================================
 # Generated figures/reports
