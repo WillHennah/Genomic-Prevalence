@@ -32,22 +32,66 @@ INCLUDE_LIKELY_PATHOGENIC = False
 clinvar_url = "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/variant_summary.txt.gz"
 output_file = "variation_summary.txt.gz"
 
-print("Downloading ClinVar variant summary...")
+MAX_FILE_AGE_DAYS = 7
 
-response = requests.get(
-    clinvar_url,
-    stream=True,
-    timeout=120
-)
-response.raise_for_status()
 
-with open(output_file, "wb") as f:
-    for chunk in response.iter_content(chunk_size=1024 * 1024):
-        if chunk:
-            f.write(chunk)
+def file_age_days(filepath):
+    """Return the age of a file in days."""
+    modified_time = os.path.getmtime(filepath)
+    current_time = time.time()
 
-print("Download complete.")
+    return (current_time - modified_time) / (60 * 60 * 24)
 
+
+def download_clinvar(url, filepath):
+    """Download the ClinVar variant summary file."""
+
+    print("Downloading ClinVar variant summary...")
+
+    response = requests.get(
+        url,
+        stream=True,
+        timeout=120
+    )
+    response.raise_for_status()
+
+    # Download to a temporary file first
+    temp_file = filepath + ".tmp"
+
+    try:
+        with open(temp_file, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+        # Only replace the old file after a successful download
+        os.replace(temp_file, filepath)
+
+    finally:
+        # Clean up an incomplete temporary download if necessary
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    print("Download complete.")
+
+
+if os.path.exists(output_file):
+
+    age_days = file_age_days(output_file)
+
+    print(f"Existing ClinVar file is {age_days:.1f} days old.")
+
+    if age_days < MAX_FILE_AGE_DAYS:
+        print("Using existing ClinVar file.")
+
+    else:
+        print("ClinVar file is at least 7 days old. Updating...")
+        download_clinvar(clinvar_url, output_file)
+
+else:
+
+    print("No existing ClinVar file found.")
+    download_clinvar(clinvar_url, output_file)
 
 # ------------------------------------------------------------
 # Read ClinVar data
