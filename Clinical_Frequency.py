@@ -18,6 +18,12 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import Normalize
 from pandas import json_normalize
 
+# ============================================================
+# Analysis settings
+# ============================================================
+
+INCLUDE_LIKELY_PATHOGENIC = False
+
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -61,8 +67,9 @@ clinvar = clinvar.convert_dtypes()
 print(f"Loaded {len(clinvar):,} ClinVar rows.")
 
 ## Trim for efficiency
-pathovar = clinvar[clinvar['ClinicalSignificance'].str.contains('Pathogenic', case=False, na=False)]
-pathovar = pathovar[pathovar['Assembly'].str.contains('GRCh38', na=False)]
+pathovar = clinvar[
+    clinvar['Assembly'].eq('GRCh38')
+].copy()
 
 pathovar = pathovar.drop(['#AlleleID', 
                     'Type',
@@ -109,22 +116,32 @@ pathovar = pathovar.explode('ClinicalSignificance')
 pathovar['ClinicalSignificance'] = pathovar['ClinicalSignificance'].str.split(';')
 pathovar = pathovar.explode('ClinicalSignificance')
 
+# Clean significance labels after exploding combined classifications
+pathovar['ClinicalSignificance'] = (
+    pathovar['ClinicalSignificance']
+    .astype('string')
+    .str.strip()
+)
+
 ### Only takes pathogenic variants, need a second version for including likely pathogenic
-pathovar = pathovar[
-    pathovar['ClinicalSignificance'].str.contains(
+if INCLUDE_LIKELY_PATHOGENIC:
+    accepted_significance = {
         'Pathogenic',
-        case=False,
-        na=False
-    )
-]
+        'Likely pathogenic'
+    }
+else:
+    accepted_significance = {
+        'Pathogenic'
+    }
 
 pathovar = pathovar[
-    ~pathovar['ClinicalSignificance'].str.contains(
-        'conflicting',
-        case=False,
-        na=False
-    )
-]
+    pathovar['ClinicalSignificance'].isin(accepted_significance)
+].copy()
+
+print(
+    "Included clinical significance values:",
+    sorted(pathovar['ClinicalSignificance'].dropna().unique())
+)
 
 print("Rows before removing duplicates:", len(pathovar))
 
