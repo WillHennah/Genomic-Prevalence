@@ -1,11 +1,4 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
-
-
-
-## Import the needed tools
+# Clinical_Frequency.py
 
 import io
 import os
@@ -13,7 +6,6 @@ import numpy as np
 import pandas as pd
 import requests
 import json
-import subprocess
 import time
 import textwrap
 import re
@@ -21,39 +13,55 @@ import re
 import seaborn as sns
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import Normalize
-
 from pandas import json_normalize
 
 
-# In[ ]:
+# ------------------------------------------------------------
+# Download latest ClinVar data
+# ------------------------------------------------------------
+
+clinvar_url = "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/variant_summary.txt.gz"
+output_file = "variation_summary.txt.gz"
+
+print("Downloading ClinVar variant summary...")
+
+response = requests.get(
+    clinvar_url,
+    stream=True,
+    timeout=120
+)
+response.raise_for_status()
+
+with open(output_file, "wb") as f:
+    for chunk in response.iter_content(chunk_size=1024 * 1024):
+        if chunk:
+            f.write(chunk)
+
+print("Download complete.")
 
 
-## Get the clinical variant data from ClinVar
-### Run only if you need to update background data
+# ------------------------------------------------------------
+# Read ClinVar data
+# ------------------------------------------------------------
 
+print("Reading ClinVar data...")
 
-ftp_url = 'https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/variant_summary.txt.gz'
-output_file = 'variation_summary.txt.gz'
+clinvar = pd.read_csv(
+    output_file,
+    sep="\t",
+    compression="gzip",
+    low_memory=False
+)
 
-# Run wget command
-subprocess.run(['wget', '-O', output_file, ftp_url])
-
-subprocess.run(['gunzip', 'variation_summary.txt.gz'])
-
-
-# In[2]:
-
-
-## Parse the ClinVar data for pathogenic variants
-
-clinvar = pd.read_csv("variation_summary.txt", delimiter="\t")
 clinvar = clinvar.convert_dtypes()
+
+print(f"Loaded {len(clinvar):,} ClinVar rows.")
 
 ## Trim for efficiency
 pathovar = clinvar[clinvar['ClinicalSignificance'].str.contains('Pathogenic', case=False, na=False)]
-#pathovar = clinvar[clinvar['ClinicalSignificance'].str.contains('Pathogenic', na=False)]
 pathovar = pathovar[pathovar['Assembly'].str.contains('GRCh38', na=False)]
 
 pathovar = pathovar.drop(['#AlleleID', 
@@ -102,16 +110,61 @@ pathovar['ClinicalSignificance'] = pathovar['ClinicalSignificance'].str.split(';
 pathovar = pathovar.explode('ClinicalSignificance')
 
 ### Only takes pathogenic variants, need a second version for including likely pathogenic
-pathovar = pathovar[pathovar['ClinicalSignificance'].str.contains('Pathogenic', case=False, na=False)]
-#pathovar = pathovar[pathovar['ClinicalSignificance'].str.contains('Pathogenic', na=False)]
-pathovar = pathovar[~pathovar['ClinicalSignificance'].str.contains('conflicting', case=False, na=False)]
+pathovar = pathovar[
+    pathovar['ClinicalSignificance'].str.contains(
+        'Pathogenic',
+        case=False,
+        na=False
+    )
+]
 
-pathovar = pathovar.drop_duplicates(subset=['GeneSymbol', 'PhenotypeList', 'ClinicalSignificance'])
-pathovar = pathovar[~pathovar['PhenotypeList'].str.contains('conditions|See cases|not provided|not specified', na=False)]
+pathovar = pathovar[
+    ~pathovar['ClinicalSignificance'].str.contains(
+        'conflicting',
+        case=False,
+        na=False
+    )
+]
+
+print("Rows before removing duplicates:", len(pathovar))
+
+pathovar = pathovar.drop_duplicates(
+    subset=[
+        'GeneSymbol',
+        'PhenotypeList',
+        'Chromosome',
+        'PositionVCF',
+        'ReferenceAlleleVCF',
+        'AlternateAlleleVCF'
+    ]
+)
+
+print("Rows after removing duplicates:", len(pathovar))
+
+print(
+    "Unique variants:",
+    pathovar[
+        [
+            'Chromosome',
+            'PositionVCF',
+            'ReferenceAlleleVCF',
+            'AlternateAlleleVCF'
+        ]
+    ].drop_duplicates().shape[0]
+)
+
+pathovar = pathovar[
+    ~pathovar['PhenotypeList'].str.contains(
+        'conditions|See cases|not provided|not specified',
+        na=False
+    )
+]
+
 pathovar = pathovar.reset_index(drop=True)
 
-pathovar = pathovar[~pathovar['GeneSymbol'].str.contains('-|covers|subset', na=False)]
-pathovar = pathovar.reset_index(drop=True)
+
+# here
+
 
 ## Additionally parse for phenotypes of interest too
 
