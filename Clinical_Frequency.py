@@ -10,11 +10,12 @@ import time
 import textwrap
 import re
 import random
-
+import sqlite3
 import seaborn as sns
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
+from datetime import datetime, timezone
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import Normalize
 from pandas import json_normalize
@@ -32,11 +33,33 @@ EXCLUDED_POPULATION_IDS = {
     "remaining_XY",
 }
 
+# ============================================================
+# gnomAD cache settings
+# ============================================================
+
+# For development only. Later, set this to None for all variants.
+GNOMAD_TEST_LIMIT = 5
+
+GNOMAD_CACHE_FILE = "gnomad_cache.sqlite"
+GNOMAD_DATASET = "gnomad_r4"
+
+# Refresh cached gnomAD results after this many days.
+GNOMAD_CACHE_MAX_AGE_DAYS = 90
+
+# Set True to ignore cache age and query gnomAD again.
+FORCE_GNOMAD_REFRESH = False
+
+# Development limit. Set to None later for all variants.
+GNOMAD_TEST_LIMIT = 5
+
 # ------------------------------------------------------------
 # Download latest ClinVar data
 # ------------------------------------------------------------
 
-clinvar_url = "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/variant_summary.txt.gz"
+clinvar_url = (
+    "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/"
+    "tab_delimited/variant_summary.txt.gz"
+)
 output_file = "variation_summary.txt.gz"
 
 MAX_FILE_AGE_DAYS = 7
@@ -49,6 +72,34 @@ def file_age_days(filepath):
 
     return (current_time - modified_time) / (60 * 60 * 24)
 
+def cache_is_current(
+    cached_status,
+    max_age_days=GNOMAD_CACHE_MAX_AGE_DAYS,
+):
+    """
+    Return True if a cached gnomAD result is still considered current.
+    """
+
+    if cached_status is None:
+        return False
+
+    queried_at = cached_status.get("queried_at")
+
+    if not queried_at:
+        return False
+
+    queried_time = datetime.fromisoformat(queried_at)
+
+    if queried_time.tzinfo is None:
+        queried_time = queried_time.replace(
+            tzinfo=timezone.utc
+        )
+
+    age = datetime.now(timezone.utc) - queried_time
+
+    return age.total_seconds() < (
+        max_age_days * 24 * 60 * 60
+    )
 
 def download_clinvar(url, filepath):
     """Download the ClinVar variant summary file."""
@@ -80,7 +131,6 @@ def download_clinvar(url, filepath):
             os.remove(temp_file)
 
     print("Download complete.")
-
 
 if os.path.exists(output_file):
 
@@ -245,7 +295,6 @@ pvars.to_csv("Pathogenic_Variants.csv", index=False)
 # ============================================================
 
 GNOMAD_API_URL = "https://gnomad.broadinstitute.org/api"
-GNOMAD_DATASET = "gnomad_r4"
 
 GNOMAD_HEADERS = {
     "Content-Type": "application/json",
@@ -305,6 +354,299 @@ RETRYABLE_STATUS_CODES = {
     504,
 }
 
+def initialise_gnomad_cache(cache_file=GNOMAD_CACHE_FILE):
+    """
+    Create the SQLite gnomAD cache and required tables.
+
+    The cache contains:
+      1. One query-status row per variant and dataset.
+      2. Raw population frequency rows from exomes and genomes.
+    """
+
+    with sqlite3.connect(cache_file) as connection:
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS query_status (
+                variant_id TEXT NOT NULL,
+                dataset TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                queried_at TEXT NOT NULL,
+
+                PRIMARY KEY (variant_id, dataset)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS population_frequencies (
+                variant_id TEXT NOT NULL,
+                dataset TEXT NOT NULL,
+                source TEXT NOT NULL,
+                population_id TEXT NOT NULL,
+                ac INTEGER,
+                an INTEGER,
+                af REAL,
+
+                PRIMARY KEY (
+                    variant_id,
+                    dataset,
+                    source,
+                    population_id
+                )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_frequency_variant
+            ON population_frequencies (
+                variant_id,
+                dataset
+            )
+            """
+        )
+
+        connection.commit()
+
+def get_cached_status(
+    variant_id,
+    dataset=GNOMAD_DATASET,
+    cache_file=GNOMAD_CACHE_FILE,
+):
+    """
+    Return the cached status for a variant, or None if the variant
+    has not previously completed successfully.
+    """
+
+    with sqlite3.connect(cache_file) as connection:
+
+        result = connection.execute(
+            """
+            SELECT status, error, queried_at
+            FROM query_status
+            WHERE variant_id = ?
+              AND dataset = ?
+            """,
+            (
+                variant_id,
+                dataset,
+            ),
+        ).fetchone()
+
+    if result is None:
+        return None
+
+    return {
+        "status": result[0],
+        "error": result[1],
+        "queried_at": result[2],
+    }
+
+def save_gnomad_result_to_cache(
+    query_result,
+    frequency_df,
+    dataset=GNOMAD_DATASET,
+    cache_file=GNOMAD_CACHE_FILE,
+):
+    """
+    Save one completed gnomAD query to SQLite.
+
+    Only terminal data outcomes are cached:
+        success
+        not_found
+
+    Request and GraphQL failures are not cached, allowing them
+    to be retried on the next run.
+    """
+
+    status = query_result["status"]
+
+    if status not in {"success", "not_found"}:
+        return False
+
+    variant_id = query_result["variant_id"]
+
+    queried_at = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    with sqlite3.connect(cache_file) as connection:
+
+        try:
+            connection.execute("BEGIN")
+
+            # Remove old population rows before replacing a
+            # successfully re-queried variant.
+            if status == "success":
+                connection.execute(
+                    """
+                    DELETE FROM population_frequencies
+                    WHERE variant_id = ?
+                      AND dataset = ?
+                    """,
+                    (
+                        variant_id,
+                        dataset,
+                    ),
+                )
+
+                if not frequency_df.empty:
+
+                    rows_to_insert = []
+
+                    for row in frequency_df.itertuples(index=False):
+
+                        ac = (
+                            None
+                            if pd.isna(row.ac)
+                            else int(row.ac)
+                        )
+
+                        an = (
+                            None
+                            if pd.isna(row.an)
+                            else int(row.an)
+                        )
+
+                        af = (
+                            None
+                            if pd.isna(row.af)
+                            else float(row.af)
+                        )
+
+                        rows_to_insert.append(
+                            (
+                                variant_id,
+                                dataset,
+                                str(row.source),
+                                str(row.population_id),
+                                ac,
+                                an,
+                                af,
+                            )
+                        )
+
+                    connection.executemany(
+                        """
+                        INSERT OR REPLACE INTO population_frequencies (
+                            variant_id,
+                            dataset,
+                            source,
+                            population_id,
+                            ac,
+                            an,
+                            af
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows_to_insert,
+                    )
+
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO query_status (
+                    variant_id,
+                    dataset,
+                    status,
+                    error,
+                    queried_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    variant_id,
+                    dataset,
+                    status,
+                    query_result.get("error"),
+                    queried_at,
+                ),
+            )
+
+            connection.commit()
+            return True
+
+        except Exception:
+            connection.rollback()
+            raise
+
+def load_cached_frequencies(
+    variant_ids=None,
+    dataset=GNOMAD_DATASET,
+    cache_file=GNOMAD_CACHE_FILE,
+):
+    """
+    Load raw gnomAD population frequencies from SQLite.
+
+    If variant_ids is None, load every cached frequency row.
+    """
+
+    with sqlite3.connect(cache_file) as connection:
+
+        if variant_ids is None:
+
+            frequency_df = pd.read_sql_query(
+                """
+                SELECT
+                    variant_id,
+                    source,
+                    population_id,
+                    ac,
+                    an,
+                    af
+                FROM population_frequencies
+                WHERE dataset = ?
+                """,
+                connection,
+                params=(dataset,),
+            )
+
+        else:
+
+            variant_ids = list(dict.fromkeys(variant_ids))
+
+            if not variant_ids:
+                return pd.DataFrame(
+                    columns=[
+                        "variant_id",
+                        "source",
+                        "population_id",
+                        "ac",
+                        "an",
+                        "af",
+                    ]
+                )
+
+            placeholders = ",".join(
+                ["?"] * len(variant_ids)
+            )
+
+            query = f"""
+                SELECT
+                    variant_id,
+                    source,
+                    population_id,
+                    ac,
+                    an,
+                    af
+                FROM population_frequencies
+                WHERE dataset = ?
+                  AND variant_id IN ({placeholders})
+            """
+
+            frequency_df = pd.read_sql_query(
+                query,
+                connection,
+                params=[
+                    dataset,
+                    *variant_ids,
+                ],
+            )
+
+    return frequency_df
 
 def query_gnomad_variant(
     variant_id,
@@ -494,15 +836,21 @@ def normalise_gnomad_result(query_result):
     status = query_result["status"]
 
     if status != "success":
-        return pd.DataFrame()
+        return pd.DataFrame(
+            columns=[
+                "variant_id",
+                "source",
+                "population_id",
+                "ac",
+                "an",
+                "af",
+            ]
+        )
 
     variant_data = query_result["data"]
-    rsid = variant_data.get("rsid")
-
     rows = []
 
     for source in ["exome", "genome"]:
-
         source_data = variant_data.get(source)
 
         if source_data is None:
@@ -511,11 +859,13 @@ def normalise_gnomad_result(query_result):
         populations = source_data.get("populations") or []
 
         for population in populations:
-
+            population_id = population.get("id")
             ac = population.get("ac")
             an = population.get("an")
 
-            # Calculate AF ourselves from AC/AN where possible.
+            if population_id is None:
+                continue
+
             if ac is not None and an not in (None, 0):
                 af = ac / an
             else:
@@ -524,16 +874,25 @@ def normalise_gnomad_result(query_result):
             rows.append(
                 {
                     "variant_id": variant_id,
-                    "rsid": rsid,
                     "source": source,
-                    "population_id": population.get("id"),
+                    "population_id": population_id,
                     "ac": ac,
                     "an": an,
                     "af": af,
                 }
             )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "variant_id",
+            "source",
+            "population_id",
+            "ac",
+            "an",
+            "af",
+        ],
+    )
 
 def select_gnomad_frequencies(
     frequency_df,
@@ -545,10 +904,11 @@ def select_gnomad_frequencies(
 
     Selection rules
     ---------------
-    1. Population AN must be >= min_population_an.
-    2. Prefer exome where sufficient exome data exist.
-    3. Fall back to genome if exome data are insufficient.
-    4. Exclude the population if neither source has sufficient AN.
+    1. Population AN must be at least min_population_an.
+    2. Exclude population groups without a useful population label.
+    3. Prefer exome where sufficient exome data exist.
+    4. Fall back to genome where exome AN is insufficient.
+    5. Exclude the population if neither source has sufficient AN.
 
     The original raw frequency table is not modified.
     """
@@ -558,26 +918,26 @@ def select_gnomad_frequencies(
 
     df = frequency_df.copy()
 
-    # --------------------------------------------------------
-    # Remove observations without sufficient allele number
-    # --------------------------------------------------------
+    # Ensure numeric comparisons work after loading from SQLite.
+    df["an"] = pd.to_numeric(df["an"], errors="coerce")
+    df["ac"] = pd.to_numeric(df["ac"], errors="coerce")
+    df["af"] = pd.to_numeric(df["af"], errors="coerce")
 
+    # Require sufficient allele number.
     df = df[
         df["an"].notna()
         & (df["an"] >= min_population_an)
     ].copy()
 
+    # Exclude labels that are not interpretable populations.
     df = df[
         ~df["population_id"].isin(EXCLUDED_POPULATION_IDS)
     ].copy()
 
     if df.empty:
-        return df
+        return df.reset_index(drop=True)
 
-    # --------------------------------------------------------
-    # Prefer exome over genome
-    # --------------------------------------------------------
-
+    # Prefer exome, falling back to genome.
     source_priority = {
         "exome": 1,
         "genome": 2,
@@ -597,10 +957,6 @@ def select_gnomad_frequencies(
         ]
     )
 
-    # --------------------------------------------------------
-    # Keep the highest-priority usable source
-    # --------------------------------------------------------
-
     selected = df.drop_duplicates(
         subset=[
             "variant_id",
@@ -616,8 +972,10 @@ def select_gnomad_frequencies(
     return selected.reset_index(drop=True)
 
 # ============================================================
-# Test the updated gnomAD query on five variants
+# Query gnomAD with persistent SQLite caching
 # ============================================================
+
+initialise_gnomad_cache()
 
 all_variants = (
     pvars["variant"]
@@ -627,69 +985,207 @@ all_variants = (
     .tolist()
 )
 
-test_variants = all_variants[:5]
+if GNOMAD_TEST_LIMIT is None:
+    variants_to_process = all_variants
+else:
+    variants_to_process = all_variants[:GNOMAD_TEST_LIMIT]
 
-print(f"Testing gnomAD query on {len(test_variants)} variants.")
+print(
+    f"Processing {len(variants_to_process):,} "
+    "gnomAD variants."
+)
 
-frequency_results = []
 query_log = []
 
+cached_count = 0
+queried_count = 0
+success_count = 0
+not_found_count = 0
+failure_count = 0
+
 with requests.Session() as session:
-
-    session.headers.update(
-        {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": (
-                "genomic-prevalence/0.1 "
-                "(research frequency calculation)"
-            ),
-        }
-    )
-
     for number, variant_id in enumerate(
-        test_variants,
+        variants_to_process,
         start=1,
     ):
-
-        print(
-            f"[{number}/{len(test_variants)}] "
-            f"Querying {variant_id}"
+        cached_status = get_cached_status(
+            variant_id=variant_id
         )
 
-        result = query_gnomad_variant(
+        # Reuse completed cached outcomes.
+        if (
+            not FORCE_GNOMAD_REFRESH
+            and cached_status is not None
+            and cached_status["status"] in {
+                "success",
+                "not_found",
+            }
+            and cache_is_current(cached_status)
+        ):
+            cached_count += 1
+
+            print(
+                f"[{number}/{len(variants_to_process)}] "
+                f"Cached: {variant_id} "
+                f"({cached_status['status']})"
+            )
+
+            query_log.append(
+                {
+                    "variant_id": variant_id,
+                    "status": cached_status["status"],
+                    "result_source": "cache",
+                    "error": cached_status["error"],
+                }
+            )
+
+            continue
+
+        if FORCE_GNOMAD_REFRESH:
+            query_reason = "forced refresh"
+
+        elif cached_status is None:
+            query_reason = "not cached"
+
+        elif not cache_is_current(cached_status):
+            query_reason = "cache expired"
+
+        else:
+            query_reason = "retrying previous failure"
+
+        # Query variants not already cached.
+        print(
+            f"[{number}/{len(variants_to_process)}] "
+            f"Querying: {variant_id} "
+            f"({query_reason})"
+        )
+
+        query_result = query_gnomad_variant(
             variant_id=variant_id,
             session=session,
         )
 
+        queried_count += 1
+
+        raw_frequency_df = normalise_gnomad_result(
+            query_result
+        )
+
+        was_cached = save_gnomad_result_to_cache(
+            query_result=query_result,
+            frequency_df=raw_frequency_df,
+        )
+
+        status = query_result["status"]
+
+        if status == "success":
+            success_count += 1
+        elif status == "not_found":
+            not_found_count += 1
+        else:
+            failure_count += 1
+
         query_log.append(
             {
                 "variant_id": variant_id,
-                "status": result["status"],
-                "error": result["error"],
+                "status": status,
+                "result_source": (
+                    "api_saved"
+                    if was_cached
+                    else "api_not_cached"
+                ),
+                "error": query_result["error"],
             }
         )
 
-        variant_frequencies = normalise_gnomad_result(result)
+        # Be considerate of the public gnomAD API.
+        time.sleep(
+            1.0 + random.uniform(0, 0.5)
+        )
 
-        if not variant_frequencies.empty:
-            frequency_results.append(variant_frequencies)
 
-        # Be considerate of the public API.
-        time.sleep(1)
+# ============================================================
+# Load cached results and select usable frequencies
+# ============================================================
+
+gnomad_frequency_raw = load_cached_frequencies(
+    variant_ids=variants_to_process
+)
+
+gnomad_frequency_selected = select_gnomad_frequencies(
+    gnomad_frequency_raw
+)
 
 gnomad_query_log = pd.DataFrame(query_log)
 
-if frequency_results:
 
-    gnomad_frequency_test = pd.concat(
-        frequency_results,
-        ignore_index=True,
-    )
-    gnomad_frequency_selected = select_gnomad_frequencies(
-        gnomad_frequency_test
+# ============================================================
+# Development summary
+# ============================================================
+
+print("\nRun summary")
+print("-----------")
+print(
+    f"Variants requested: "
+    f"{len(variants_to_process):,}"
+)
+print(
+    f"Reused from cache: "
+    f"{cached_count:,}"
+)
+print(
+    f"Queried from API: "
+    f"{queried_count:,}"
+)
+print(
+    f"New successful results: "
+    f"{success_count:,}"
+)
+print(
+    f"New not-found results: "
+    f"{not_found_count:,}"
+)
+print(
+    f"Uncached failures: "
+    f"{failure_count:,}"
+)
+
+print("\nQuery status:")
+if gnomad_query_log.empty:
+    print("No variants were processed.")
+else:
+    print(
+        gnomad_query_log.to_string(
+            index=False
+        )
     )
 
+print("\nSelected frequency sources:")
+if gnomad_frequency_selected.empty:
+    print("No usable population frequencies.")
+else:
+    print(
+        gnomad_frequency_selected["source"]
+        .value_counts()
+        .to_string()
+    )
+
+print(
+    f"\nMinimum population AN: "
+    f"{MIN_POPULATION_AN:,}"
+)
+
+print(
+    "Raw cached population rows:",
+    len(gnomad_frequency_raw),
+)
+
+print(
+    "Selected population rows:",
+    len(gnomad_frequency_selected),
+)
+
+if not gnomad_frequency_selected.empty:
     print("\nSelected gnomAD frequencies:")
     print(
         gnomad_frequency_selected[
@@ -703,84 +1199,6 @@ if frequency_results:
             ]
         ].to_string(index=False)
     )
-
-    print("\nSelected frequency sources:")
-    print(
-        gnomad_frequency_selected["source"]
-        .value_counts()
-        .to_string()
-    )
-
-    print(
-        f"\nMinimum population AN: "
-        f"{MIN_POPULATION_AN:,}"
-    )
-
-    print(
-        "Number of population estimates retained:",
-        len(gnomad_frequency_selected)
-    )
-
-    print(
-        "Number of raw population estimates:",
-        len(gnomad_frequency_test)
-    )
-
-
-else:
-
-    gnomad_frequency_test = pd.DataFrame(
-        columns=[
-            "variant_id",
-            "rsid",
-            "source",
-            "population_id",
-            "ac",
-            "an",
-            "af",
-        ]
-    )
-
-
-print("\nQuery status:")
-print(gnomad_query_log.to_string(index=False))
-
-print("\nFrequency output:")
-print(gnomad_frequency_test.head(20).to_string(index=False))
-
-print(
-    "\nRows returned:",
-    len(gnomad_frequency_test)
-)
-
-print(
-    "Sources returned:",
-    sorted(
-        gnomad_frequency_test["source"]
-        .dropna()
-        .unique()
-        .tolist()
-    )
-)
-
-print(
-    "Population IDs returned:",
-    sorted(
-        gnomad_frequency_test["population_id"]
-        .dropna()
-        .unique()
-        .tolist()
-    )[:30]
-)
-gnomad_query_log.to_csv(
-    "gnomad_query_log_test.csv",
-    index=False,
-)
-
-gnomad_frequency_test.to_csv(
-    "gnomad_frequency_test.csv",
-    index=False,
-)
 
 #here
 

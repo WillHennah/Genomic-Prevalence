@@ -58,6 +58,10 @@ Pathogenic_Variant_Frequencies_All.csv
 Summmed_Frequencies.csv
 Gene_Based_Prevalences.csv
 
+# Local gnomAD SQLite cache
+gnomad_cache.sqlite
+gnomad_cache.sqlite-shm
+gnomad_cache.sqlite-wal
 
 # ============================================================
 # Failed gnomAD query logs
