@@ -1,31 +1,28 @@
 # Clinical_Frequency.py
 
-import io
 import os
 import numpy as np
 import pandas as pd
 import requests
-import json
 import time
-import textwrap
-import re
 import random
 import sqlite3
-import seaborn as sns
-import matplotlib as mpl
-import matplotlib.pyplot as plt
 
 from datetime import datetime, timezone
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import Normalize
-from pandas import json_normalize
 
 # ============================================================
 # Analysis settings
 # ============================================================
 
 INCLUDE_LIKELY_PATHOGENIC = False
+
+# Minimum gnomAD allele number required for a population estimate.
 MIN_POPULATION_AN = 10_000
+
+# Maximum AF allowed for the rare, highly penetrant disease model.
+# Variants at or above this frequency are retained for QC,
+# but excluded from prevalence calculations.
+MAX_MODEL_ELIGIBLE_AF = 0.01
 
 EXCLUDED_POPULATION_IDS = {
     "remaining",
@@ -34,11 +31,21 @@ EXCLUDED_POPULATION_IDS = {
 }
 
 # ============================================================
+# Variant evidence status labels
+# ============================================================
+
+STATUS_INCLUDED = "included"
+STATUS_GNOMAD_NOT_FOUND = "gnomad_not_found"
+STATUS_INSUFFICIENT_AN = "insufficient_population_an"
+STATUS_EXCLUDED_COMMON = "excluded_common"
+STATUS_QUERY_FAILED = "query_failed"
+
+# ============================================================
 # gnomAD cache settings
 # ============================================================
 
 # For development only. Later, set this to None for all variants.
-GNOMAD_TEST_LIMIT = 5
+GNOMAD_TEST_LIMIT = 100
 
 GNOMAD_CACHE_FILE = "gnomad_cache.sqlite"
 GNOMAD_DATASET = "gnomad_r4"
@@ -48,9 +55,6 @@ GNOMAD_CACHE_MAX_AGE_DAYS = 90
 
 # Set True to ignore cache age and query gnomAD again.
 FORCE_GNOMAD_REFRESH = False
-
-# Development limit. Set to None later for all variants.
-GNOMAD_TEST_LIMIT = 5
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -178,7 +182,6 @@ pathovar = pathovar.drop(['#AlleleID',
                     'HGNC_ID',
                     'nsv/esv (dbVar)',
                     'RCVaccession',
-                    'PhenotypeIDS',
                     'Origin',
                     'Start',
                     'Stop',
@@ -188,12 +191,8 @@ pathovar = pathovar.drop(['#AlleleID',
                     'ChromosomeAccession',
                     'Guidelines',
                     'OtherIDs',
-                    'NumberSubmitters',
                     'ClinSigSimple',
-                    'GeneID',
                     'SubmitterCategories',
-                    'VariationID',
-                    'ReviewStatusOncogenicity',
                     'SCVsForAggregateGermlineClassification',
                     'SCVsForAggregateSomaticClinicalImpact',
                     'SCVsForAggregateOncogenicityClassification', 
@@ -347,6 +346,7 @@ query VariantPopulationFrequencies(
 """
 
 RETRYABLE_STATUS_CODES = {
+    403,
     429,
     500,
     502,
@@ -445,6 +445,42 @@ def get_cached_status(
         "error": result[1],
         "queried_at": result[2],
     }
+
+def load_cached_query_status(
+    variant_ids=None,
+    dataset=GNOMAD_DATASET,
+    cache_file=GNOMAD_CACHE_FILE,
+):
+    """
+    Load cached gnomAD query status information.
+    """
+
+    with sqlite3.connect(cache_file) as connection:
+
+        status_df = pd.read_sql_query(
+            """
+            SELECT
+                variant_id,
+                status AS gnomad_query_status,
+                error AS gnomad_query_error,
+                queried_at
+            FROM query_status
+            WHERE dataset = ?
+            """,
+            connection,
+            params=(dataset,),
+        )
+
+    if variant_ids is not None:
+        variant_ids = set(variant_ids)
+
+        status_df = status_df[
+            status_df["variant_id"].isin(
+                variant_ids
+            )
+        ].copy()
+
+    return status_df
 
 def save_gnomad_result_to_cache(
     query_result,
@@ -666,15 +702,6 @@ def query_gnomad_variant(
         },
     }
 
-    retryable_statuses = {
-        403,
-        429,
-        500,
-        502,
-        503,
-        504,
-    }
-
     for attempt in range(1, max_retries + 1):
 
         try:
@@ -751,7 +778,7 @@ def query_gnomad_variant(
             # Cloudflare / rate limiting / server error
             # ------------------------------------------
 
-            if response.status_code in retryable_statuses:
+            if response.status_code in RETRYABLE_STATUS_CODES:
 
                 if attempt == max_retries:
 
@@ -1118,6 +1145,60 @@ gnomad_frequency_selected = select_gnomad_frequencies(
 
 gnomad_query_log = pd.DataFrame(query_log)
 
+gnomad_cached_status = load_cached_query_status(
+    variant_ids=variants_to_process
+)
+
+# Include non-cached failures from the current run so that they
+# remain distinguishable from variants that were not evaluated.
+current_run_status = gnomad_query_log[
+    [
+        "variant_id",
+        "status",
+        "error",
+    ]
+].rename(
+    columns={
+        "status": "gnomad_query_status",
+        "error": "gnomad_query_error",
+    }
+)
+
+current_run_status["queried_at"] = pd.NA
+
+gnomad_cached_status = pd.concat(
+    [
+        gnomad_cached_status,
+        current_run_status,
+    ],
+    ignore_index=True,
+)
+
+# Prefer the SQLite record when a completed cached result and
+# a current-run log entry both exist.
+gnomad_cached_status["status_priority"] = np.where(
+    gnomad_cached_status["queried_at"].notna(),
+    1,
+    2,
+)
+
+gnomad_cached_status = (
+    gnomad_cached_status
+    .sort_values(
+        [
+            "variant_id",
+            "status_priority",
+        ]
+    )
+    .drop_duplicates(
+        subset=["variant_id"],
+        keep="first",
+    )
+    .drop(
+        columns=["status_priority"]
+    )
+    .reset_index(drop=True)
+)
 
 # ============================================================
 # Development summary
@@ -1200,701 +1281,772 @@ if not gnomad_frequency_selected.empty:
         ].to_string(index=False)
     )
 
-#here
+# ============================================================
+# Join ClinVar annotations to selected gnomAD frequencies
+# ============================================================
 
-pheno = pd.read_csv("Pathogenic_Variants.csv", delimiter=",")
-pheno = pheno.drop(['SomaticClinicalImpact',
-                   'SomaticClinicalImpactLastEvaluated',
-                   'ReviewStatusClinicalImpact'], axis=1)
+clinvar_gnomad = pvars.merge(
+    gnomad_frequency_selected,
+    left_on="variant",
+    right_on="variant_id",
+    how="inner",
+    validate="m:m",
+)
 
-freq = pd.read_csv("Pathogenic_Variant_Frequencies_All.csv", delimiter=",")
-freq = freq.drop(['hgdp:japanese',
-                'hgdp:japanese_XX',
-                'hgdp:japanese_XY',
-                'hgdp:adygei',
-                'hgdp:adygei_XX',
-                'hgdp:adygei_XY',
-                'hgdp:orcadian',
-                'hgdp:orcadian_XX',
-                'hgdp:orcadian_XY',
-                'hgdp:bantusouthafrica',
-                'hgdp:bantusouthafrica_XX',
-                'hgdp:bantusouthafrica_XY',
-                'hgdp:yakut',
-                'hgdp:yakut_XX',
-                'hgdp:yakut_XY',
-                'hgdp:han',
-                'hgdp:han_XX',
-                'hgdp:han_XY',
-                'hgdp:uygur',
-                'hgdp:uygur_XX',
-                'hgdp:uygur_XY',
-                'hgdp:balochi',
-                'hgdp:balochi_XX',
-                'hgdp:balochi_XY',
-                'hgdp:bedouin',
-                'hgdp:bedouin_XX',
-                'hgdp:bedouin_XY',
-                'hgdp:russian',
-                'hgdp:russian_XX',
-                'hgdp:russian_XY',
-                'hgdp:daur',
-                'hgdp:daur_XX',
-                'hgdp:daur_XY',
-                'hgdp:pima',
-                'hgdp:pima_XX',
-                'hgdp:pima_XY',
-                'hgdp:hezhen',
-                'hgdp:hezhen_XX',
-                'hgdp:hezhen_XY',
-                'hgdp:biaka',
-                'hgdp:biaka_XX',
-                'hgdp:biaka_XY',
-                'hgdp:miao',
-                'hgdp:miao_XX',
-                'hgdp:miao_XY',
-                'hgdp:sindhi',
-                'hgdp:sindhi_XX',
-                'hgdp:sindhi_XY',
-                'hgdp:northernhan',
-                'hgdp:northernhan_XX',
-                'hgdp:northernhan_XY',
-                'hgdp:oroqen',
-                'hgdp:oroqen_XX',
-                'hgdp:oroqen_XY',
-                'hgdp:san',
-                'hgdp:san_XX',
-                'hgdp:san_XY',
-                'hgdp:tu',
-                'hgdp:tu_XX',
-                'hgdp:tu_XY',
-                'hgdp:tuscan',
-                'hgdp:tuscan_XX',
-                'hgdp:tuscan_XY',
-                'hgdp:mbuti',
-                'hgdp:mbuti_XX',
-                'hgdp:mbuti_XY',
-                'hgdp:palestinian',
-                'hgdp:palestinian_XX',
-                'hgdp:palestinian_XY',
-                'hgdp:tujia',
-                'hgdp:tujia_XX',
-                'hgdp:tujia_XY',
-                'hgdp:druze',
-                'hgdp:druze_XX',
-                'hgdp:druze_XY',
-                'hgdp:pathan',
-                'hgdp:pathan_XX',
-                'hgdp:pathan_XY',
-                'hgdp:basque',
-                'hgdp:basque_XX',
-                'hgdp:basque_XY',
-                'hgdp:makrani',
-                'hgdp:makrani_XX',
-                'hgdp:makrani_XY',
-                'hgdp:burusho',
-                'hgdp:burusho_XX',
-                'hgdp:burusho_XY',
-                'hgdp:mongolian',
-                'hgdp:mongolian_XX',
-                'hgdp:mongolian_XY',
-                'hgdp:bougainville',
-                'hgdp:bougainville_XX',
-                'hgdp:bougainville_XY',
-                'hgdp:papuansepik',
-                'hgdp:papuansepik_XX',
-                'hgdp:papuansepik_XY',
-                'hgdp:yi',
-                'hgdp:yi_XX',
-                'hgdp:yi_XY',
-                'hgdp:naxi',
-                'hgdp:naxi_XX',
-                'hgdp:naxi_XY',
-                'hgdp:lahu',
-                'hgdp:lahu_XX',
-                'hgdp:lahu_XY',
-                'hgdp:sardinian',
-                'hgdp:sardinian_XX',
-                'hgdp:sardinian_XY',
-                'hgdp:karitiana',
-                'hgdp:karitiana_XX',
-                'hgdp:karitiana_XY',
-                'hgdp:mozabite',
-                'hgdp:mozabite_XX',
-                'hgdp:mozabite_XY',
-                'hgdp:yoruba',
-                'hgdp:yoruba_XX',
-                'hgdp:yoruba_XY',
-                'hgdp:dai',
-                'hgdp:dai_XX',
-                'hgdp:dai_XY',
-                'hgdp:bergamoitalian',
-                'hgdp:bergamoitalian_XX',
-                'hgdp:bergamoitalian_XY',
-                'hgdp:cambodian',
-                'hgdp:cambodian_XX',
-                'hgdp:cambodian_XY',
-                'hgdp:french',
-                'hgdp:french_XX',
-                'hgdp:french_XY',
-                'hgdp:mandenka',
-                'hgdp:mandenka_XX',
-                'hgdp:mandenka_XY',
-                'hgdp:surui',
-                'hgdp:surui_XX',
-                'hgdp:surui_XY',
-                'hgdp:brahui',
-                'hgdp:brahui_XX',
-                'hgdp:brahui_XY',
-                'hgdp:hazara',
-                'hgdp:hazara_XX',
-                'hgdp:hazara_XY',
-                'hgdp:kalash',
-                'hgdp:kalash_XX',
-                'hgdp:kalash_XY',
-                'hgdp:papuanhighlands',
-                'hgdp:papuanhighlands_XX',
-                'hgdp:papuanhighlands_XY',
-                'hgdp:xibo',
-                'hgdp:xibo_XX',
-                'hgdp:xibo_XY',
-                'hgdp:colombian',
-                'hgdp:colombian_XX',
-                'hgdp:colombian_XY',
-                'hgdp:bantukenya',
-                'hgdp:bantukenya_XX',
-                'hgdp:bantukenya_XY',
-                'hgdp:she',
-                'hgdp:she_XX',
-                'hgdp:she_XY',
-                'hgdp:maya',
-                'hgdp:maya_XX',
-                'hgdp:maya_XY',
-                'hgdp:XX',
-                'hgdp:XY',
-                '1kg:esn',
-                '1kg:esn_XX',
-                '1kg:esn_XY',
-                '1kg:pur',
-                '1kg:pur_XX',
-                '1kg:pur_XY',
-                '1kg:pjl',
-                '1kg:pjl_XX',
-                '1kg:pjl_XY',
-                '1kg:clm',
-                '1kg:clm_XX',
-                '1kg:clm_XY',
-                '1kg:jpt',
-                '1kg:jpt_XX',
-                '1kg:jpt_XY',
-                '1kg:chb',
-                '1kg:chb_XX',
-                '1kg:chb_XY',
-                '1kg:stu',
-                '1kg:stu_XX',
-                '1kg:stu_XY',
-                '1kg:itu',
-                '1kg:itu_XX',
-                '1kg:itu_XY',
-                '1kg:tsi',
-                '1kg:tsi_XX',
-                '1kg:tsi_XY',
-                '1kg:mxl',
-                '1kg:mxl_XX',
-                '1kg:mxl_XY',
-                '1kg:ceu',
-                '1kg:ceu_XX',
-                '1kg:ceu_XY',
-                '1kg:msl',
-                '1kg:msl_XX',
-                '1kg:msl_XY',
-                '1kg:beb',
-                '1kg:beb_XX',
-                '1kg:beb_XY',
-                '1kg:yri',
-                '1kg:yri_XX',
-                '1kg:yri_XY',
-                '1kg:fin',
-                '1kg:fin_XX',
-                '1kg:fin_XY',
-                '1kg:khv',
-                '1kg:khv_XX',
-                '1kg:khv_XY',
-                '1kg:cdx',
-                '1kg:cdx_XX',
-                '1kg:cdx_XY',
-                '1kg:lwk',
-                '1kg:lwk_XX',
-                '1kg:lwk_XY',
-                '1kg:acb',
-                '1kg:acb_XX',
-                '1kg:acb_XY',
-                '1kg:asw',
-                '1kg:asw_XX',
-                '1kg:asw_XY',
-                '1kg:ibs',
-                '1kg:ibs_XX',
-                '1kg:ibs_XY',
-                '1kg:gbr',
-                '1kg:gbr_XX',
-                '1kg:gbr_XY',
-                '1kg:pel',
-                '1kg:pel_XX',
-                '1kg:pel_XY',
-                '1kg:gih',
-                '1kg:gih_XX',
-                '1kg:gih_XY',
-                '1kg:chs',
-                '1kg:chs_XX',
-                '1kg:chs_XY',
-                '1kg:gwd',
-                '1kg:gwd_XX',
-                '1kg:gwd_XY',
-                '1kg:XX',
-                '1kg:XY'], axis=1)
+print("\nClinVar + gnomAD joined data")
+print("----------------------------")
 
+print(
+    f"Rows: {len(clinvar_gnomad):,}"
+)
 
+print(
+    "Unique variants:",
+    clinvar_gnomad["variant"].nunique()
+)
 
-joined = pd.merge(pheno, freq, left_on='variant', right_on='id', how='inner', validate='m:m')
-joined = joined.convert_dtypes()
+print(
+    "Unique genes:",
+    clinvar_gnomad["GeneSymbol"].nunique()
+)
 
-columns_to_sum = joined.columns[16:48]
+print(
+    "Unique phenotypes:",
+    clinvar_gnomad["PhenotypeList"].nunique()
+)
 
+frequency_analysis = clinvar_gnomad[
+    [
+        "variant",
+        "GeneSymbol",
+        "PhenotypeList",
+        "Chromosome",
+        "population_id",
+        "source",
+        "ac",
+        "an",
+        "af",
+    ]
+].copy()
 
-joined = joined.drop_duplicates(subset=['variant', 'PhenotypeList'])
-# Step 3: Group by 'gene' and 'phenotypes' and sum
-grouped = joined.groupby(['GeneSymbol', 'PhenotypeList'])[columns_to_sum].sum().reset_index()
+frequency_analysis = frequency_analysis.drop_duplicates()
 
-grouped = grouped.merge(joined[['GeneSymbol', 'Chromosome']], left_on='GeneSymbol', right_on='GeneSymbol', how='left')
-grouped = grouped.drop_duplicates(subset=['GeneSymbol', 'PhenotypeList'])
-# Optional: Save the result
-grouped.to_csv("Summmed_Frequencies.csv", index=False)
+print(
+    "\nAnalysis rows after removing exact duplicates:",
+    len(frequency_analysis)
+)
 
+def split_population_and_sex(population_id):
+    """
+    Separate a gnomAD population ID into population and sex.
 
-# In[7]:
+    Examples
+    --------
+    nfe     -> nfe, all
+    nfe_XX  -> nfe, XX
+    nfe_XY  -> nfe, XY
+    XX      -> overall, XX
+    XY      -> overall, XY
+    """
 
+    if pd.isna(population_id):
+        return pd.NA, pd.NA
 
-## Convert Frequences to Prevalences
-#### Using Hardy-Weinberg Equilibrium ... A^2 + 2AB + B^2 = 1
-###### For autosomes
-#### Carrier frequency = 2AB + B^2
-#### Homozygote frequency = B^2
-###### For genes on the X chromosome
-#### Carrier frequency = (2AB + B^2)/2 + (B/2)
-#### Homozygote frequency = (B^2)/2 + (B/2)
+    population_id = str(population_id)
 
-popn = pd.read_csv("popn.txt", delimiter=",")
-popnx = popn.set_index('ABV').T.to_dict('list')
+    if population_id == "XX":
+        return "overall", "XX"
 
-for key, values in popnx.items():
-    abv = key
-    full = values[0]
-    
-    def calculate_carrier_prevalence(row):
-        if pd.isna(row[abv + "_XY"]) or pd.isna(row['Chromosome']):
-            return pd.NA
-        elif row['Chromosome'] == 'X':
-            return row[abv + "_XY"] * 100000
-        else:
-            return ((2 * (row[abv + "_XY"] * (1 - row[abv + "_XY"]))) + (row[abv + "_XY"]**2)) * 100000
-    
-    grouped[full + ' Male Carrier Prevalence'] = grouped.apply(calculate_carrier_prevalence, axis=1)
-    
-for key, values in popnx.items():
-    abv = key
-    full = values[0]
-    
-    grouped[full + ' Female Carrier Prevalence'] = ((2 * (grouped[abv + "_XX"] * (1 - grouped[abv + "_XX"]))) + (grouped[abv + "_XX"]**2)) * 100000
-    
-    
-for key, values in popnx.items():
-    abv = key
-    full = values[0]
-    
-    def calculate_all_carrier_prevalence(row):
-        if pd.isna(row[abv]) or pd.isna(row['Chromosome']):
-            return pd.NA
-        elif row['Chromosome'] == 'X':
-            return ((((2 * (row[abv] * (1 - row[abv]))) + (row[abv]**2))/2) + (row[abv]/2)) * 100000
-        else:
-            return ((2 * (row[abv] * (1 - row[abv]))) + (row[abv]**2)) * 100000
-    
-    grouped[full + ' Carrier Prevalence'] = grouped.apply(calculate_all_carrier_prevalence, axis=1)
-    
-    
-for key, values in popnx.items():
-    abv = key
-    full = values[0]
-    
-    def calculate_hom_carrier_prevalence(row):
-        if pd.isna(row[abv + "_XY"]) or pd.isna(row['Chromosome']):
-            return pd.NA
-        elif row['Chromosome'] == 'X':
-            return row[abv + "_XY"] * 100000
-        else:
-            return (row[abv + "_XY"]**2) * 100000
-    
-    grouped[full + ' Male Hom Carrier Prevalence'] = grouped.apply(calculate_hom_carrier_prevalence, axis=1)
-    
-for key, values in popnx.items():
-    abv = key
-    full = values[0]
-    
-    grouped[full + ' Female Hom Carrier Prevalence'] = (grouped[abv + "_XX"]**2) * 100000
-    
-    
-for key, values in popnx.items():
-    abv = key
-    full = values[0]
-    
-    def calculate_all_hom_carrier_prevalence(row):
-        if pd.isna(row[abv]) or pd.isna(row['Chromosome']):
-            return pd.NA
-        elif row['Chromosome'] == 'X':
-            return (((row[abv]**2)/2) + (row[abv]/2)) * 100000
-        else:
-            return (row[abv]**2) * 100000
-    
-    grouped[full + ' Hom Carrier Prevalence'] = grouped.apply(calculate_all_hom_carrier_prevalence, axis=1)
+    if population_id == "XY":
+        return "overall", "XY"
 
+    if population_id.endswith("_XX"):
+        return population_id[:-3], "XX"
 
-    
-grouped = grouped.drop(['remaining',
-                'remaining_XX',
-                'remaining_XY',
-                'amr',
-                'amr_XX',
-                'amr_XY',
-                'fin',
-                'fin_XX',
-                'fin_XY',
-                'mid',
-                'mid_XX',
-                'mid_XY',
-                'nfe',
-                'nfe_XX',
-                'nfe_XY',
-                'sas',
-                'sas_XX',
-                'sas_XY',
-                'asj',
-                'asj_XX',
-                'asj_XY',
-                'eas',
-                'eas_XX',
-                'eas_XY',
-                'afr',
-                'afr_XX',
-                'afr_XY',
-                'ami',
-                'ami_XX',
-                'ami_XY',
-                'XX',
-                'XY'], axis=1)
+    if population_id.endswith("_XY"):
+        return population_id[:-3], "XY"
 
-grouped = grouped.convert_dtypes()   
-grouped.to_csv("Gene_Based_Prevalences.csv", index=False)
+    return population_id, "all"
 
+population_sex = (
+    frequency_analysis["population_id"]
+    .apply(split_population_and_sex)
+)
 
-# In[8]:
+frequency_analysis[
+    ["population", "sex"]
+] = pd.DataFrame(
+    population_sex.tolist(),
+    index=frequency_analysis.index,
+)
 
+print("\nPopulation/sex combinations")
+print("---------------------------")
 
-#Carrier Frequency
+population_sex_check = (
+    frequency_analysis[
+        [
+            "population_id",
+            "population",
+            "sex",
+        ]
+    ]
+    .drop_duplicates()
+    .sort_values(
+        by=[
+            "population",
+            "sex",
+        ]
+    )
+)
 
-## Import Results for Graphical Representation
+print(
+    population_sex_check.to_string(
+        index=False
+    )
+)
 
-carprevtot = pd.read_csv("Gene_Based_Prevalences.csv", delimiter=",")
-carprevtot = carprevtot.convert_dtypes()
+duplicate_mask = frequency_analysis.duplicated(
+    subset=[
+        "variant",
+        "GeneSymbol",
+        "PhenotypeList",
+        "population",
+        "sex",
+    ],
+    keep=False,
+)
 
-## Tidy Columns
+duplicate_rows = frequency_analysis[
+    duplicate_mask
+].copy()
 
-carprevtot = carprevtot.drop(['Chromosome',
-' European (excluding Finland) Male Carrier Prevalence',
-' Finnish Male Carrier Prevalence',
-' American (admixed) Male Carrier Prevalence',
-' African/African American Male Carrier Prevalence',
-' Amish Male Carrier Prevalence',
-' Middle Eastern Male Carrier Prevalence',
-' South Asian Male Carrier Prevalence',
-' East Asian Male Carrier Prevalence',
-' Ashkenazi Jewish Male Carrier Prevalence',
-' European (excluding Finland) Female Carrier Prevalence',
-' Finnish Female Carrier Prevalence',
-' American (admixed) Female Carrier Prevalence',
-' African/African American Female Carrier Prevalence',
-' Amish Female Carrier Prevalence',
-' Middle Eastern Female Carrier Prevalence',
-' South Asian Female Carrier Prevalence',
-' East Asian Female Carrier Prevalence',
-' Ashkenazi Jewish Female Carrier Prevalence',
-' European (excluding Finland) Male Hom Carrier Prevalence',
-' Finnish Male Hom Carrier Prevalence',
-' American (admixed) Male Hom Carrier Prevalence',
-' African/African American Male Hom Carrier Prevalence',
-' Amish Male Hom Carrier Prevalence',
-' Middle Eastern Male Hom Carrier Prevalence',
-' South Asian Male Hom Carrier Prevalence',
-' East Asian Male Hom Carrier Prevalence',
-' Ashkenazi Jewish Male Hom Carrier Prevalence',
-' European (excluding Finland) Female Hom Carrier Prevalence',
-' Finnish Female Hom Carrier Prevalence',
-' American (admixed) Female Hom Carrier Prevalence',
-' African/African American Female Hom Carrier Prevalence',
-' Amish Female Hom Carrier Prevalence',
-' Middle Eastern Female Hom Carrier Prevalence',
-' South Asian Female Hom Carrier Prevalence',
-' East Asian Female Hom Carrier Prevalence',
-' Ashkenazi Jewish Female Hom Carrier Prevalence',
-' European (excluding Finland) Hom Carrier Prevalence',
-' Finnish Hom Carrier Prevalence',
-' American (admixed) Hom Carrier Prevalence',
-' African/African American Hom Carrier Prevalence',
-' Amish Hom Carrier Prevalence',
-' Middle Eastern Hom Carrier Prevalence',
-' South Asian Hom Carrier Prevalence',
-' East Asian Hom Carrier Prevalence',
-' Ashkenazi Jewish Hom Carrier Prevalence'], axis=1)
+print(
+    "\nDuplicate "
+    "variant/gene/phenotype/population/sex rows:",
+    len(duplicate_rows)
+)
 
+if not frequency_analysis.empty:
 
-carprevtot = carprevtot.rename(columns={' European (excluding Finland) Carrier Prevalence': 'European \n (excl Finland)', ' Finnish Carrier Prevalence': 'Finnish', ' American (admixed) Carrier Prevalence': 'American \n (admixed)', ' African/African American Carrier Prevalence': 'African/ \n African American', ' Amish Carrier Prevalence': 'Amish', ' Middle Eastern Carrier Prevalence': 'Middle Eastern', ' South Asian Carrier Prevalence': 'South Asian', ' East Asian Carrier Prevalence': 'East Asian', ' Ashkenazi Jewish Carrier Prevalence': 'Ashkenazi Jewish',})
+    example_variant = (
+        frequency_analysis["variant"]
+        .iloc[0]
+    )
 
+    print(
+        f"\nExample joined data for "
+        f"{example_variant}"
+    )
 
-prevalence_columns = ['European \n (excl Finland)', 'Finnish', 'American \n (admixed)', 'African/ \n African American', 'Amish', 'Middle Eastern', 'South Asian', 'East Asian', 'Ashkenazi Jewish']
+    example_data = frequency_analysis[
+        frequency_analysis["variant"]
+        == example_variant
+    ][
+        [
+            "GeneSymbol",
+            "PhenotypeList",
+            "Chromosome",
+            "population",
+            "sex",
+            "source",
+            "ac",
+            "an",
+            "af",
+        ]
+    ]
 
-
-max_value = carprevtot[prevalence_columns].max().max()
-# Round up to the nearest 100
-vmax = int(np.ceil(max_value / 100.0)) * 100
-
-# Get unique phenotypes
-phenotypes = carprevtot['PhenotypeList'].unique()
-
-
-# Create a multi-page PDF
-with PdfPages('carrier_prevalence_heatmaps_by_phenotype.pdf') as pdf:
-    for phenotype in phenotypes:
-        subset = carprevtot[carprevtot['PhenotypeList'] == phenotype].copy()
-        subset['Label'] = subset['GeneSymbol']
-        subset.set_index('Label', inplace=True)
-        heatmap_data = subset[prevalence_columns]
-
-#Set figure height dynamically
-        row_height = 1.5
-        fig_height = max(4.5, len(heatmap_data) * row_height)
-
-        fig, ax = plt.subplots(figsize=(10, fig_height))
-        sns.heatmap(
-            heatmap_data,
-            annot=True,
-            cmap='inferno_r',
-            fmt=".1f",
-            linewidths=0.5,
-            vmin=0,
-            vmax=vmax,
-            ax=ax
+    print(
+        example_data.to_string(
+            index=False
         )
-        ax.set_title(f'Carrier Prevalence by Population for Genes Causing \n {phenotype}')
-        ax.xaxis.set_ticks_position('top')
-        ax.xaxis.set_tick_params(rotation=50)
-        ax.set_xlabel('Population')
-        ax.set_ylabel('Gene')
-        ax.yaxis.set_tick_params(rotation=0)
-        plt.tight_layout()
+    )
 
-        pdf.savefig(fig)
-        plt.close(fig)
+# ============================================================
+# Build ClinVar variant evidence table
+# ============================================================
+
+# Keep every unique ClinVar variant/gene/phenotype relationship.
+clinvar_evidence_base = (
+    pvars[
+        [
+            "variant",
+            "GeneSymbol",
+            "PhenotypeList",
+            "Chromosome",
+            "ClinicalSignificance",
+        ]
+    ]
+    .drop_duplicates()
+    .copy()
+)
+
+# During development, include only variants that were part of
+# the current limited gnomAD run.
+clinvar_evidence_base = clinvar_evidence_base[
+    clinvar_evidence_base["variant"].isin(
+        variants_to_process
+    )
+].copy()
+
+print(
+    "\nClinVar evidence relationships in current run:",
+    len(clinvar_evidence_base)
+)
 
 
+# ------------------------------------------------------------
+# Add cached gnomAD query status
+# ------------------------------------------------------------
+
+variant_evidence = clinvar_evidence_base.merge(
+    gnomad_cached_status,
+    left_on="variant",
+    right_on="variant_id",
+    how="left",
+    validate="m:1",
+)
+
+variant_evidence = variant_evidence.drop(
+    columns=["variant_id"]
+)
 
 
-# Get unique genes
-genesg = carprevtot['GeneSymbol'].unique()
+# ------------------------------------------------------------
+# Summarise usable gnomAD frequency information by variant
+# ------------------------------------------------------------
+
+variant_frequency_summary = (
+    gnomad_frequency_selected
+    .groupby(
+        "variant_id",
+        as_index=False,
+    )
+    .agg(
+        maximum_observed_af=(
+            "af",
+            "max",
+        ),
+        populations_with_usable_data=(
+            "population_id",
+            "nunique",
+        ),
+    )
+)
 
 
-# Create a multi-page PDF
-with PdfPages('carrier_prevalence_heatmaps_by_gene.pdf') as pdf:
-    for genes in genesg:
-        subset = carprevtot[carprevtot['GeneSymbol'] == genes].copy()
-        subset['Label'] = subset['PhenotypeList']
-        subset.set_index('Label', inplace=True)
-        heatmap_data = subset[prevalence_columns]
+# ------------------------------------------------------------
+# Add usable frequency summary to the evidence table
+# ------------------------------------------------------------
 
-#Set figure height dynamically
-        row_height = 1.5  
-        fig_width = 10
-        fig_height = max(4.5, len(heatmap_data) * row_height)
+variant_evidence = variant_evidence.merge(
+    variant_frequency_summary,
+    left_on="variant",
+    right_on="variant_id",
+    how="left",
+    validate="m:1",
+)
 
-        fig, ax = plt.subplots(figsize=(10, fig_height))
-        sns.heatmap(
-            heatmap_data,
-            annot=True,
-            cmap='inferno_r',
-            fmt=".1f",
-            linewidths=0.5,
-            vmin=0,
-            vmax=vmax,
-            ax=ax
+variant_evidence = variant_evidence.drop(
+    columns=["variant_id"]
+)
+
+
+# ------------------------------------------------------------
+# Initialise evidence classification
+# ------------------------------------------------------------
+
+variant_evidence["evidence_status"] = pd.NA
+variant_evidence["evidence_reason"] = pd.NA
+
+
+# ------------------------------------------------------------
+# 1. Variant was not found in gnomAD
+# ------------------------------------------------------------
+
+not_found_mask = (
+    variant_evidence["gnomad_query_status"]
+    == "not_found"
+)
+
+variant_evidence.loc[
+    not_found_mask,
+    "evidence_status",
+] = STATUS_GNOMAD_NOT_FOUND
+
+variant_evidence.loc[
+    not_found_mask,
+    "evidence_reason",
+] = "Variant not found in gnomAD"
+
+
+# ------------------------------------------------------------
+# 2. Variant query failed
+# ------------------------------------------------------------
+
+failure_mask = (
+    variant_evidence["gnomad_query_status"].notna()
+    & ~variant_evidence[
+        "gnomad_query_status"
+    ].isin(
+        [
+            "success",
+            "not_found",
+        ]
+    )
+)
+
+variant_evidence.loc[
+    failure_mask,
+    "evidence_status",
+] = STATUS_QUERY_FAILED
+
+variant_evidence.loc[
+    failure_mask,
+    "evidence_reason",
+] = (
+    "gnomAD query did not complete successfully"
+)
+
+
+# ------------------------------------------------------------
+# 3. Variant exists, but no usable population passes AN
+# ------------------------------------------------------------
+
+insufficient_an_mask = (
+    (
+        variant_evidence["gnomad_query_status"]
+        == "success"
+    )
+    & variant_evidence[
+        "maximum_observed_af"
+    ].isna()
+)
+
+variant_evidence.loc[
+    insufficient_an_mask,
+    "evidence_status",
+] = STATUS_INSUFFICIENT_AN
+
+variant_evidence.loc[
+    insufficient_an_mask,
+    "evidence_reason",
+] = (
+    f"No population estimate with "
+    f"AN >= {MIN_POPULATION_AN:,}"
+)
+
+
+# ------------------------------------------------------------
+# 4. Variant is too common for the penetrant model
+# ------------------------------------------------------------
+
+common_mask = (
+    variant_evidence[
+        "maximum_observed_af"
+    ].notna()
+    & (
+        variant_evidence[
+            "maximum_observed_af"
+        ]
+        >= MAX_MODEL_ELIGIBLE_AF
+    )
+)
+
+variant_evidence.loc[
+    common_mask,
+    "evidence_status",
+] = STATUS_EXCLUDED_COMMON
+
+variant_evidence.loc[
+    common_mask,
+    "evidence_reason",
+] = (
+    "Variant exceeds rare, highly penetrant "
+    "model AF threshold in at least one "
+    "well-powered population"
+)
+
+
+# ------------------------------------------------------------
+# 5. Remaining variants with usable frequencies are included
+# ------------------------------------------------------------
+
+included_mask = (
+    (
+        variant_evidence["gnomad_query_status"]
+        == "success"
+    )
+    & variant_evidence[
+        "maximum_observed_af"
+    ].notna()
+    & variant_evidence[
+        "evidence_status"
+    ].isna()
+)
+
+variant_evidence.loc[
+    included_mask,
+    "evidence_status",
+] = STATUS_INCLUDED
+
+variant_evidence.loc[
+    included_mask,
+    "evidence_reason",
+] = (
+    "Included in rare, highly penetrant allele model"
+)
+
+
+# ------------------------------------------------------------
+# 6. Catch anything that could not be classified
+# ------------------------------------------------------------
+
+unclassified_mask = (
+    variant_evidence["evidence_status"].isna()
+)
+
+variant_evidence.loc[
+    unclassified_mask,
+    "evidence_status",
+] = "not_evaluated"
+
+variant_evidence.loc[
+    unclassified_mask,
+    "evidence_reason",
+] = (
+    "Variant has not yet been fully evaluated"
+)
+
+
+# ============================================================
+# Create Dash-ready variant evidence tables
+# ============================================================
+
+# ClinVar Pathogenic variants used in the prevalence estimate.
+evidence_included = variant_evidence[
+    variant_evidence["evidence_status"]
+    == STATUS_INCLUDED
+].copy()
+
+
+# ClinVar Pathogenic variants without usable gnomAD frequency.
+evidence_without_frequency = variant_evidence[
+    variant_evidence[
+        "evidence_status"
+    ].isin(
+        [
+            STATUS_GNOMAD_NOT_FOUND,
+            STATUS_INSUFFICIENT_AN,
+        ]
+    )
+].copy()
+
+
+# ClinVar Pathogenic variants excluded because their maximum
+# reliable population AF exceeds the model threshold.
+evidence_excluded_common = variant_evidence[
+    variant_evidence["evidence_status"]
+    == STATUS_EXCLUDED_COMMON
+].copy()
+
+
+# Operational failures are tracked separately from biological
+# absence or insufficient population data.
+evidence_query_failed = variant_evidence[
+    variant_evidence["evidence_status"]
+    == STATUS_QUERY_FAILED
+].copy()
+
+
+# Variants that were not fully classified.
+evidence_not_evaluated = variant_evidence[
+    variant_evidence["evidence_status"]
+    == "not_evaluated"
+].copy()
+
+
+# ============================================================
+# Evidence QC summary
+# ============================================================
+
+print("\nVariant evidence summary")
+print("------------------------")
+
+# Count unique variants rather than ClinVar phenotype rows.
+evidence_summary = (
+    variant_evidence[
+        [
+            "variant",
+            "evidence_status",
+        ]
+    ]
+    .drop_duplicates()
+    ["evidence_status"]
+    .value_counts()
+)
+
+print(
+    evidence_summary.to_string()
+)
+
+print(
+    "\nUnique variants included:",
+    evidence_included["variant"].nunique()
+)
+
+print(
+    "Unique variants without usable gnomAD frequency:",
+    evidence_without_frequency["variant"].nunique()
+)
+
+print(
+    "Unique variants excluded as common:",
+    evidence_excluded_common["variant"].nunique()
+)
+
+print(
+    "Unique variants with query failures:",
+    evidence_query_failed["variant"].nunique()
+)
+
+print(
+    "Unique variants not evaluated:",
+    evidence_not_evaluated["variant"].nunique()
+)
+
+
+# ------------------------------------------------------------
+# Reconciliation check
+# ------------------------------------------------------------
+
+processed_unique_variants = len(
+    set(variants_to_process)
+)
+
+classified_unique_variants = (
+    variant_evidence[
+        [
+            "variant",
+            "evidence_status",
+        ]
+    ]
+    .drop_duplicates()
+    ["variant"]
+    .nunique()
+)
+
+print(
+    "\nUnique processed variants:",
+    processed_unique_variants
+)
+
+print(
+    "Unique variants represented in evidence table:",
+    classified_unique_variants
+)
+
+# ============================================================
+# Calculate autosomal pathogenic allele burden
+# ============================================================
+
+autosomal_frequency_analysis = frequency_analysis[
+    (frequency_analysis["Chromosome"].astype(str) != "X")
+    & (frequency_analysis["sex"] == "all")
+].copy()
+
+print(
+    "\nAutosomal variant/population observations:",
+    len(autosomal_frequency_analysis)
+)
+
+# ============================================================
+# Apply variant-level evidence classification
+# ============================================================
+
+included_variant_ids = set(
+    evidence_included["variant"].unique()
+)
+
+excluded_common_variant_ids = set(
+    evidence_excluded_common["variant"].unique()
+)
+
+
+# Population frequency observations that are allowed
+# to contribute to the prevalence model.
+autosomal_model_data = autosomal_frequency_analysis[
+    autosomal_frequency_analysis["variant"].isin(
+        included_variant_ids
+    )
+].copy()
+
+
+# Population frequency observations for ClinVar Pathogenic
+# variants excluded because the variant is too common in at
+# least one sufficiently powered population.
+autosomal_flagged_common = autosomal_frequency_analysis[
+    autosomal_frequency_analysis["variant"].isin(
+        excluded_common_variant_ids
+    )
+].copy()
+
+# ============================================================
+# Report common variants excluded from the autosomal model
+# ============================================================
+
+autosomal_flagged_common[
+    "exclusion_reason"
+] = (
+    "Variant exceeds rare, highly penetrant "
+    "model AF threshold in at least one "
+    "well-powered population"
+)
+
+print(
+    "\nAutosomal observations excluded from the "
+    "rare, highly penetrant model:",
+    len(autosomal_flagged_common)
+)
+
+if not autosomal_flagged_common.empty:
+    print(
+        autosomal_flagged_common[
+            [
+                "variant",
+                "GeneSymbol",
+                "PhenotypeList",
+                "population",
+                "source",
+                "ac",
+                "an",
+                "af",
+                "exclusion_reason",
+            ]
+        ]
+        .sort_values(
+            "af",
+            ascending=False,
         )
-        ax.set_title(f'Carrier Prevalence by Population for Phenotypes Caused by \n {genes}')
-        ax.xaxis.set_ticks_position('top')
-        ax.set_xlabel('Population')
-        ax.xaxis.set_tick_params(rotation=50)
-        ax.set_ylabel('Phenotype')
-        wrapped_labels = [textwrap.fill(label, width=20, break_long_words=False) for label in heatmap_data.index]
-        ax.set_yticklabels(wrapped_labels, rotation=0)
-        plt.tight_layout()
+        .head(30)
+        .to_string(index=False)
+    )
 
-        pdf.savefig(fig)
-        plt.close(fig)
+print(
+    "Unique variants excluded from the autosomal model:",
+    autosomal_flagged_common["variant"].nunique()
+)
 
+# ============================================================
+# Calculate eligible autosomal pathogenic allele burden
+# ============================================================
 
-# In[9]:
+autosomal_allele_burden = (
+    autosomal_model_data
+    .groupby(
+        [
+            "GeneSymbol",
+            "PhenotypeList",
+            "Chromosome",
+            "population",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        pathogenic_allele_frequency=(
+            "af",
+            "sum",
+        ),
+        number_of_variants=(
+            "variant",
+            "nunique",
+        ),
+        minimum_an=(
+            "an",
+            "min",
+        ),
+    )
+)
 
+autosomal_allele_burden["invalid_q"] = (
+    autosomal_allele_burden[
+        "pathogenic_allele_frequency"
+    ] > 1
+)
 
-#Homozygote Carrier Frequency
+print("\nAutosomal allele burden summary")
+print("-------------------------------")
 
-## Import Results for Graphical Representation
+print(
+    "Gene/phenotype/population combinations:",
+    len(autosomal_allele_burden)
+)
 
-homprevtot = pd.read_csv("Gene_Based_Prevalences.csv", delimiter=",")
-homprevtot = homprevtot.convert_dtypes()
+print(
+    "Combinations with q > 1:",
+    autosomal_allele_burden[
+        "invalid_q"
+    ].sum()
+)
 
-## Tidy Columns
+# ============================================================
+# Summarise variants excluded from the model
+# ============================================================
 
-homprevtot = homprevtot.drop(['Chromosome',
-' European (excluding Finland) Male Carrier Prevalence',
-' Finnish Male Carrier Prevalence',
-' American (admixed) Male Carrier Prevalence',
-' African/African American Male Carrier Prevalence',
-' Amish Male Carrier Prevalence',
-' Middle Eastern Male Carrier Prevalence',
-' South Asian Male Carrier Prevalence',
-' East Asian Male Carrier Prevalence',
-' Ashkenazi Jewish Male Carrier Prevalence',
-' European (excluding Finland) Female Carrier Prevalence',
-' Finnish Female Carrier Prevalence',
-' American (admixed) Female Carrier Prevalence',
-' African/African American Female Carrier Prevalence',
-' Amish Female Carrier Prevalence',
-' Middle Eastern Female Carrier Prevalence',
-' South Asian Female Carrier Prevalence',
-' East Asian Female Carrier Prevalence',
-' Ashkenazi Jewish Female Carrier Prevalence',
-' European (excluding Finland) Carrier Prevalence',
-' Finnish Carrier Prevalence',
-' American (admixed) Carrier Prevalence',
-' African/African American Carrier Prevalence',
-' Amish Carrier Prevalence',
-' Middle Eastern Carrier Prevalence',
-' South Asian Carrier Prevalence',
-' East Asian Carrier Prevalence',
-' Ashkenazi Jewish Carrier Prevalence',
-' European (excluding Finland) Male Hom Carrier Prevalence',
-' Finnish Male Hom Carrier Prevalence',
-' American (admixed) Male Hom Carrier Prevalence',
-' African/African American Male Hom Carrier Prevalence',
-' Amish Male Hom Carrier Prevalence',
-' Middle Eastern Male Hom Carrier Prevalence',
-' South Asian Male Hom Carrier Prevalence',
-' East Asian Male Hom Carrier Prevalence',
-' Ashkenazi Jewish Male Hom Carrier Prevalence',
-' European (excluding Finland) Female Hom Carrier Prevalence',
-' Finnish Female Hom Carrier Prevalence',
-' American (admixed) Female Hom Carrier Prevalence',
-' African/African American Female Hom Carrier Prevalence',
-' Amish Female Hom Carrier Prevalence',
-' Middle Eastern Female Hom Carrier Prevalence',
-' South Asian Female Hom Carrier Prevalence',
-' East Asian Female Hom Carrier Prevalence',
-' Ashkenazi Jewish Female Hom Carrier Prevalence'], axis=1)
+flagged_common_summary = (
+    autosomal_flagged_common
+    .groupby(
+        [
+            "GeneSymbol",
+            "PhenotypeList",
+            "population",
+        ],
+        as_index=False,
+    )
+    .agg(
+        flagged_common_variants=(
+            "variant",
+            "nunique",
+        ),
+        maximum_flagged_af=(
+            "af",
+            "max",
+        ),
+    )
+)
 
+autosomal_allele_burden = (
+    autosomal_allele_burden
+    .merge(
+        flagged_common_summary,
+        on=[
+            "GeneSymbol",
+            "PhenotypeList",
+            "population",
+        ],
+        how="outer",
+    )
+)
 
-homprevtot = homprevtot.rename(columns={' European (excluding Finland) Hom Carrier Prevalence': 'European \n (excl Finland)', ' Finnish Hom Carrier Prevalence': 'Finnish', ' American (admixed) Hom Carrier Prevalence': 'American \n (admixed)', ' African/African American Hom Carrier Prevalence': 'African/ \n African American', ' Amish Hom Carrier Prevalence': 'Amish', ' Middle Eastern Hom Carrier Prevalence': 'Middle Eastern', ' South Asian Hom Carrier Prevalence': 'South Asian', ' East Asian Hom Carrier Prevalence': 'East Asian', ' Ashkenazi Jewish Hom Carrier Prevalence': 'Ashkenazi Jewish',})
+autosomal_allele_burden[
+    "flagged_common_variants"
+] = (
+    autosomal_allele_burden[
+        "flagged_common_variants"
+    ]
+    .fillna(0)
+    .astype(int)
+)
 
+print("\nLargest autosomal pathogenic allele burdens:")
 
-prevalence_columns = ['European \n (excl Finland)', 'Finnish', 'American \n (admixed)', 'African/ \n African American', 'Amish', 'Middle Eastern', 'South Asian', 'East Asian', 'Ashkenazi Jewish']
-
-
-max_value = homprevtot[prevalence_columns].max().max()
-# Round up to the nearest 100
-vmax = int(np.ceil(max_value / 10000.0)) * 10000
-
-# Get unique phenotypes
-phenotypes = homprevtot['PhenotypeList'].unique()
-
-
-# Create a multi-page PDF
-with PdfPages('homozygote_carrier_prevalence_heatmaps_by_phenotype.pdf') as pdf:
-    for phenotype in phenotypes:
-        subset = homprevtot[homprevtot['PhenotypeList'] == phenotype].copy()
-        subset['Label'] = subset['GeneSymbol']
-        subset.set_index('Label', inplace=True)
-        heatmap_data = subset[prevalence_columns]
-
-#Set figure height dynamically
-        row_height = 1.5
-        fig_height = max(4.5, len(heatmap_data) * row_height)
-
-        fig, ax = plt.subplots(figsize=(10, fig_height))
-        sns.heatmap(
-            heatmap_data,
-            annot=True,
-            cmap='inferno_r',
-            fmt=".1f",
-            linewidths=0.5,
-            vmin=0,
-            vmax=vmax,
-            ax=ax
-        )
-        ax.set_title(f'"Homozygote" Carrier Prevalence by Population for Genes Causing \n {phenotype}')
-        ax.xaxis.set_ticks_position('top')
-        ax.xaxis.set_tick_params(rotation=50)
-        ax.set_xlabel('Population')
-        ax.set_ylabel('Gene')
-        ax.yaxis.set_tick_params(rotation=0)
-        plt.tight_layout()
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-
-
-
-# Get unique genes
-genesg = homprevtot['GeneSymbol'].unique()
-
-
-# Create a multi-page PDF
-with PdfPages('homozygote_carrier_prevalence_heatmaps_by_gene.pdf') as pdf:
-    for genes in genesg:
-        subset = homprevtot[homprevtot['GeneSymbol'] == genes].copy()
-        subset['Label'] = subset['PhenotypeList']
-        subset.set_index('Label', inplace=True)
-        heatmap_data = subset[prevalence_columns]
-
-#Set figure height dynamically
-        row_height = 1.5  
-        fig_width = 10
-        fig_height = max(4.5, len(heatmap_data) * row_height)
-
-        fig, ax = plt.subplots(figsize=(10, fig_height))
-        sns.heatmap(
-            heatmap_data,
-            annot=True,
-            cmap='inferno_r',
-            fmt=".1f",
-            linewidths=0.5,
-            vmin=0,
-            vmax=vmax,
-            ax=ax
-        )
-        ax.set_title(f'"Homozygote" Carrier Prevalence by Population for Phenotypes Caused by \n {genes}')
-        ax.xaxis.set_ticks_position('top')
-        ax.set_xlabel('Population')
-        ax.xaxis.set_tick_params(rotation=50)
-        ax.set_ylabel('Phenotype')
-        wrapped_labels = [textwrap.fill(label, width=20, break_long_words=False) for label in heatmap_data.index]
-        ax.set_yticklabels(wrapped_labels, rotation=0)
-        plt.tight_layout()
-
-        pdf.savefig(fig)
-        plt.close(fig)
+print(
+    autosomal_allele_burden
+    .sort_values(
+        "pathogenic_allele_frequency",
+        ascending=False,
+    )
+    .head(30)
+    .to_string(index=False)
+)
