@@ -24,6 +24,13 @@ from pandas import json_normalize
 # ============================================================
 
 INCLUDE_LIKELY_PATHOGENIC = False
+MIN_POPULATION_AN = 10_000
+
+EXCLUDED_POPULATION_IDS = {
+    "remaining",
+    "remaining_XX",
+    "remaining_XY",
+}
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -523,16 +530,90 @@ def normalise_gnomad_result(query_result):
                     "ac": ac,
                     "an": an,
                     "af": af,
-                    "homozygote_count": population.get(
-                        "homozygote_count"
-                    ),
-                    "hemizygote_count": population.get(
-                        "hemizygote_count"
-                    ),
                 }
             )
 
     return pd.DataFrame(rows)
+
+def select_gnomad_frequencies(
+    frequency_df,
+    min_population_an=MIN_POPULATION_AN,
+):
+    """
+    Select one usable gnomAD frequency estimate for each
+    variant/population combination.
+
+    Selection rules
+    ---------------
+    1. Population AN must be >= min_population_an.
+    2. Prefer exome where sufficient exome data exist.
+    3. Fall back to genome if exome data are insufficient.
+    4. Exclude the population if neither source has sufficient AN.
+
+    The original raw frequency table is not modified.
+    """
+
+    if frequency_df.empty:
+        return frequency_df.copy()
+
+    df = frequency_df.copy()
+
+    # --------------------------------------------------------
+    # Remove observations without sufficient allele number
+    # --------------------------------------------------------
+
+    df = df[
+        df["an"].notna()
+        & (df["an"] >= min_population_an)
+    ].copy()
+
+    df = df[
+        ~df["population_id"].isin(EXCLUDED_POPULATION_IDS)
+    ].copy()
+
+    if df.empty:
+        return df
+
+    # --------------------------------------------------------
+    # Prefer exome over genome
+    # --------------------------------------------------------
+
+    source_priority = {
+        "exome": 1,
+        "genome": 2,
+    }
+
+    df["source_priority"] = (
+        df["source"]
+        .map(source_priority)
+        .fillna(99)
+    )
+
+    df = df.sort_values(
+        by=[
+            "variant_id",
+            "population_id",
+            "source_priority",
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Keep the highest-priority usable source
+    # --------------------------------------------------------
+
+    selected = df.drop_duplicates(
+        subset=[
+            "variant_id",
+            "population_id",
+        ],
+        keep="first",
+    ).copy()
+
+    selected = selected.drop(
+        columns=["source_priority"]
+    )
+
+    return selected.reset_index(drop=True)
 
 # ============================================================
 # Test the updated gnomAD query on five variants
@@ -605,6 +686,46 @@ if frequency_results:
         frequency_results,
         ignore_index=True,
     )
+    gnomad_frequency_selected = select_gnomad_frequencies(
+        gnomad_frequency_test
+    )
+
+    print("\nSelected gnomAD frequencies:")
+    print(
+        gnomad_frequency_selected[
+            [
+                "variant_id",
+                "population_id",
+                "source",
+                "ac",
+                "an",
+                "af",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\nSelected frequency sources:")
+    print(
+        gnomad_frequency_selected["source"]
+        .value_counts()
+        .to_string()
+    )
+
+    print(
+        f"\nMinimum population AN: "
+        f"{MIN_POPULATION_AN:,}"
+    )
+
+    print(
+        "Number of population estimates retained:",
+        len(gnomad_frequency_selected)
+    )
+
+    print(
+        "Number of raw population estimates:",
+        len(gnomad_frequency_test)
+    )
+
 
 else:
 
@@ -617,8 +738,6 @@ else:
             "ac",
             "an",
             "af",
-            "homozygote_count",
-            "hemizygote_count",
         ]
     )
 
