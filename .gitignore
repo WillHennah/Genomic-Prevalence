@@ -49,6 +49,11 @@ variation_summary.txt.gz
 Pathogenic_Variants_temp.csv
 Pathogenic_Variants.csv
 
+# ============================================================
+# Generated ClinGen data
+# ============================================================
+
+clingen_gene_disease_validity.csv
 
 # ============================================================
 # Generated gnomAD data

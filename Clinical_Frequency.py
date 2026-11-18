@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import requests
 import time
+import re
 import random
 import sqlite3
 
@@ -28,6 +29,20 @@ EXCLUDED_POPULATION_IDS = {
     "remaining",
     "remaining_XX",
     "remaining_XY",
+}
+
+# ============================================================
+# ClinGen validity display settings
+# ============================================================
+
+CLINGEN_VALIDITY_RANK = {
+    "Definitive": 6,
+    "Strong": 5,
+    "Moderate": 4,
+    "Limited": 3,
+    "Disputed": 2,
+    "Refuted": 1,
+    "No supporting assertion": 0,
 }
 
 # ============================================================
@@ -55,6 +70,13 @@ GNOMAD_CACHE_MAX_AGE_DAYS = 90
 
 # Set True to ignore cache age and query gnomAD again.
 FORCE_GNOMAD_REFRESH = False
+
+# ============================================================
+# ClinGen inheritance settings
+# ============================================================
+
+CLINGEN_CACHE_MAX_AGE_DAYS = 7
+CLINGEN_FILE = "clingen_gene_disease_validity.csv"
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -179,7 +201,6 @@ pathovar = clinvar[
 pathovar = pathovar.drop(['#AlleleID', 
                     'Type',
                     'Name',
-                    'HGNC_ID',
                     'nsv/esv (dbVar)',
                     'RCVaccession',
                     'Origin',
@@ -204,11 +225,157 @@ pathovar = pathovar.drop(['#AlleleID',
 pathovar['GeneSymbol'] = pathovar['GeneSymbol'].str.split(';')
 pathovar = pathovar.explode('GeneSymbol')
 
-pathovar['PhenotypeList'] = pathovar['PhenotypeList'].str.split('|')
-pathovar = pathovar.explode('PhenotypeList')
 
-pathovar['PhenotypeList'] = pathovar['PhenotypeList'].str.split(';')
-pathovar = pathovar.explode('PhenotypeList')
+# ============================================================
+# Split ClinVar phenotype names and identifiers together
+# ============================================================
+
+pathovar["PhenotypeList"] = (
+    pathovar["PhenotypeList"]
+    .astype("string")
+    .str.split("|")
+)
+
+pathovar["PhenotypeIDS"] = (
+    pathovar["PhenotypeIDS"]
+    .astype("string")
+    .str.split("|")
+)
+
+# Explode the two corresponding ClinVar fields together so that
+# each phenotype remains paired with its own disease identifiers.
+pathovar = pathovar.explode(
+    [
+        "PhenotypeList",
+        "PhenotypeIDS",
+    ]
+)
+
+pathovar["PhenotypeList"] = (
+    pathovar["PhenotypeList"]
+    .astype("string")
+    .str.strip()
+)
+
+pathovar["PhenotypeIDS"] = (
+    pathovar["PhenotypeIDS"]
+    .astype("string")
+    .str.strip()
+)
+
+def extract_identifier(text, prefix):
+    """
+    Extract the first identifier for a given namespace
+    from an aligned ClinVar PhenotypeIDS group.
+    """
+
+    if pd.isna(text):
+        return pd.NA
+
+    text = str(text)
+
+    if prefix == "MONDO":
+        match = re.search(
+            r"MONDO:(?:MONDO:)?(\d+)",
+            text,
+        )
+
+    elif prefix == "OMIM":
+        match = re.search(
+            r"OMIM:(?:PS)?(\d+)",
+            text,
+        )
+
+    elif prefix == "MedGen":
+        match = re.search(
+            r"MedGen:(C\d+)",
+            text,
+        )
+
+    elif prefix == "Orphanet":
+        match = re.search(
+            r"Orphanet:(\d+)",
+            text,
+        )
+
+    else:
+        return pd.NA
+
+    if match is None:
+        return pd.NA
+
+    identifier = match.group(1)
+
+    return f"{prefix}:{identifier}"
+
+pathovar["MONDO_ID"] = pathovar["PhenotypeIDS"].apply(
+    lambda x: extract_identifier(x, "MONDO")
+)
+
+pathovar["OMIM_ID"] = pathovar["PhenotypeIDS"].apply(
+    lambda x: extract_identifier(x, "OMIM")
+)
+
+pathovar["MedGen_ID"] = pathovar["PhenotypeIDS"].apply(
+    lambda x: extract_identifier(x, "MedGen")
+)
+
+pathovar["Orphanet_ID"] = pathovar["PhenotypeIDS"].apply(
+    lambda x: extract_identifier(x, "Orphanet")
+)
+
+def choose_disease_id(row):
+    """
+    Choose the preferred stable disease identifier.
+
+    Priority:
+        MONDO > OMIM > Orphanet > MedGen
+    """
+
+    for column in [
+        "MONDO_ID",
+        "OMIM_ID",
+        "Orphanet_ID",
+        "MedGen_ID",
+    ]:
+        value = row[column]
+
+        if pd.notna(value):
+            return value
+
+    return pd.NA
+
+
+pathovar["Disease_ID"] = pathovar.apply(
+    choose_disease_id,
+    axis=1,
+)
+
+def normalize_hgnc_id(value):
+    """
+    Normalize ClinVar HGNC identifiers.
+    """
+
+    if pd.isna(value):
+        return pd.NA
+
+    value = str(value).strip()
+
+    match = re.search(
+        r"HGNC:(\d+)",
+        value,
+    )
+
+    if match is None:
+        return pd.NA
+
+    return f"HGNC:{match.group(1)}"
+
+
+pathovar["HGNC_ID"] = (
+    pathovar["HGNC_ID"]
+    .apply(normalize_hgnc_id)
+)
 
 pathovar['ClinicalSignificance'] = pathovar['ClinicalSignificance'].str.split('/')
 pathovar = pathovar.explode('ClinicalSignificance')
@@ -271,11 +438,12 @@ print(
 )
 
 pathovar = pathovar[
-    ~pathovar['PhenotypeList'].str.contains(
-        'conditions|See cases|not provided|not specified',
-        na=False
+    ~pathovar["PhenotypeList"].str.contains(
+        r"conditions|See cases|not provided|not specified",
+        case=False,
+        na=False,
     )
-]
+].copy()
 
 pathovar = pathovar.reset_index(drop=True)
 
@@ -288,6 +456,346 @@ pvars['variant'] = pvars['Chromosome'].astype(str) + '-' + pvars['PositionVCF'].
 
 pvars.to_csv("Pathogenic_Variants.csv", index=False)
 
+# ============================================================
+# Load ClinGen Gene-Disease Validity data
+# ============================================================
+
+clingen = pd.read_csv(
+    CLINGEN_FILE,
+    skiprows=4,
+    low_memory=False,
+)
+
+clingen = clingen[
+    clingen["GENE SYMBOL"] != "+++++++++++"
+].copy()
+
+clingen = clingen[
+    [
+        "GENE SYMBOL",
+        "GENE ID (HGNC)",
+        "DISEASE LABEL",
+        "DISEASE ID (MONDO)",
+        "MOI",
+        "CLASSIFICATION",
+        "CLASSIFICATION DATE",
+        "GCEP",
+    ]
+].copy()
+
+clingen = clingen.rename(
+    columns={
+        "GENE SYMBOL": "clingen_gene_symbol",
+        "GENE ID (HGNC)": "HGNC_ID",
+        "DISEASE LABEL": "clingen_disease_label",
+        "DISEASE ID (MONDO)": "MONDO_ID",
+        "MOI": "inheritance_mode",
+        "CLASSIFICATION": "gene_disease_validity",
+        "CLASSIFICATION DATE": "clingen_classification_date",
+        "GCEP": "clingen_gcep",
+    }
+)
+
+clingen["HGNC_ID"] = (
+    clingen["HGNC_ID"]
+    .astype("string")
+    .str.strip()
+)
+
+clingen["MONDO_ID"] = (
+    clingen["MONDO_ID"]
+    .astype("string")
+    .str.strip()
+)
+
+clingen["inheritance_mode"] = (
+    clingen["inheritance_mode"]
+    .astype("string")
+    .str.strip()
+)
+
+print("\nClinGen inheritance modes")
+print("-------------------------")
+
+print(
+    clingen["inheritance_mode"]
+    .value_counts(dropna=False)
+    .to_string()
+)
+
+clingen_duplicate_keys = clingen[
+    clingen.duplicated(
+        subset=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        keep=False,
+    )
+].copy()
+
+print(
+    "\nClinGen rows with duplicated HGNC + MONDO keys:",
+    len(clingen_duplicate_keys)
+)
+
+# ============================================================
+# Match ClinVar gene-disease relationships to ClinGen
+# ============================================================
+
+clinvar_disease_relationships = (
+    pvars[
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ]
+    ]
+    .drop_duplicates()
+    .copy()
+)
+
+clinvar_clingen = clinvar_disease_relationships.merge(
+    clingen,
+    on=[
+        "HGNC_ID",
+        "MONDO_ID",
+    ],
+    how="left",
+    validate="m:m",
+)
+
+clinvar_clingen["clingen_match"] = (
+    clinvar_clingen[
+        "inheritance_mode"
+    ].notna()
+)
+
+# ============================================================
+# Preserve individual ClinGen inheritance assertions
+# ============================================================
+
+inheritance_assertions = (
+    clinvar_clingen[
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+            "clingen_disease_label",
+            "inheritance_mode",
+            "gene_disease_validity",
+            "clingen_classification_date",
+            "clingen_gcep",
+        ]
+    ]
+    .dropna(
+        subset=["inheritance_mode"]
+    )
+    .drop_duplicates()
+    .copy()
+)
+
+inheritance_assertions[
+    "validity_rank"
+] = (
+    inheritance_assertions[
+        "gene_disease_validity"
+    ]
+    .map(CLINGEN_VALIDITY_RANK)
+)
+
+CLINGEN_MOI_LABELS = {
+    "AR": "Autosomal recessive",
+    "AD": "Autosomal dominant",
+    "XL": "X-linked",
+    "SD": "Semidominant",
+    "MT": "Mitochondrial",
+    "UD": "Undetermined",
+}
+
+inheritance_assertions[
+    "inheritance_label"
+] = (
+    inheritance_assertions[
+        "inheritance_mode"
+    ]
+    .map(CLINGEN_MOI_LABELS)
+    .fillna(
+        inheritance_assertions[
+            "inheritance_mode"
+        ]
+    )
+)
+
+inheritance_assertions[
+    "inheritance_source"
+] = "ClinGen"
+
+print("\nMatched ClinGen assertions by validity")
+print("--------------------------------------")
+
+print(
+    inheritance_assertions[
+        "gene_disease_validity"
+    ]
+    .value_counts(dropna=False)
+    .to_string()
+)
+
+relationship_match_summary = (
+    clinvar_clingen[
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "clingen_match",
+        ]
+    ]
+    .drop_duplicates()
+)
+print("\nClinVar -> ClinGen inheritance matching")
+print("---------------------------------------")
+
+print(
+    "Unique HGNC + MONDO relationships:",
+    len(relationship_match_summary)
+)
+
+print(
+    "Relationships with ClinGen inheritance:",
+    relationship_match_summary[
+        "clingen_match"
+    ].sum()
+)
+
+print(
+    "Relationships without ClinGen inheritance:",
+    (
+        ~relationship_match_summary[
+            "clingen_match"
+        ]
+    ).sum()
+)
+# ============================================================
+# Summarise ClinGen inheritance per gene-disease relationship
+# ============================================================
+
+def combine_unique_values(series):
+    values = (
+        series
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+
+    if not values:
+        return pd.NA
+
+    return "|".join(sorted(values))
+
+
+clingen_inheritance_summary = (
+    clinvar_clingen
+    .groupby(
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        inheritance_mode=(
+            "inheritance_mode",
+            combine_unique_values,
+        ),
+        gene_disease_validity=(
+            "gene_disease_validity",
+            combine_unique_values,
+        ),
+        clingen_classification_date=(
+            "clingen_classification_date",
+            combine_unique_values,
+        ),
+        clingen_gcep=(
+            "clingen_gcep",
+            combine_unique_values,
+        ),
+    )
+)
+
+def classify_inheritance_mode(moi):
+    """
+    Convert ClinGen MOI codes into model categories.
+
+    Multiple distinct modes are retained as ambiguous/multiple.
+    """
+
+    if pd.isna(moi):
+        return "unknown"
+
+    modes = set(
+        str(moi).split("|")
+    )
+
+    if modes == {"AR"}:
+        return "autosomal_recessive"
+
+    if modes == {"AD"}:
+        return "autosomal_dominant"
+
+    if modes == {"XL"}:
+        return "x_linked"
+
+    if modes == {"MT"}:
+        return "mitochondrial"
+
+    if modes == {"SD"}:
+        return "semidominant"
+
+    if modes == {"UD"}:
+        return "undetermined"
+
+    return "multiple"
+
+clingen_inheritance_summary[
+    "inheritance_model"
+] = (
+    clingen_inheritance_summary[
+        "inheritance_mode"
+    ]
+    .apply(classify_inheritance_mode)
+)
+
+clingen_inheritance_summary[
+    "inheritance_source"
+] = np.where(
+    clingen_inheritance_summary[
+        "inheritance_mode"
+    ].notna(),
+    "ClinGen",
+    pd.NA,
+)
+
+print("\nClinVar relationships by ClinGen inheritance model")
+print("---------------------------------------------------")
+
+print(
+    clingen_inheritance_summary[
+        "inheritance_model"
+    ]
+    .value_counts(
+        dropna=False
+    )
+    .to_string()
+)
 
 # ============================================================
 # Retrieve variant frequencies from gnomAD
