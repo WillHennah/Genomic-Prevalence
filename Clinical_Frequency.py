@@ -1873,8 +1873,8 @@ excluded_common_variant_ids = set(
 )
 
 
-# Population frequency observations that are allowed
-# to contribute to the prevalence model.
+# Population-frequency observations allowed to contribute
+# to the prevalence calculation.
 autosomal_model_data = autosomal_frequency_analysis[
     autosomal_frequency_analysis["variant"].isin(
         included_variant_ids
@@ -1882,9 +1882,9 @@ autosomal_model_data = autosomal_frequency_analysis[
 ].copy()
 
 
-# Population frequency observations for ClinVar Pathogenic
-# variants excluded because the variant is too common in at
-# least one sufficiently powered population.
+# Population-frequency observations excluded because the
+# variant exceeds the AF threshold in at least one
+# sufficiently powered population.
 autosomal_flagged_common = autosomal_frequency_analysis[
     autosomal_frequency_analysis["variant"].isin(
         excluded_common_variant_ids
@@ -1909,7 +1909,13 @@ print(
     len(autosomal_flagged_common)
 )
 
+print(
+    "Unique variants excluded from the autosomal model:",
+    autosomal_flagged_common["variant"].nunique()
+)
+
 if not autosomal_flagged_common.empty:
+
     print(
         autosomal_flagged_common[
             [
@@ -1931,11 +1937,6 @@ if not autosomal_flagged_common.empty:
         .head(30)
         .to_string(index=False)
     )
-
-print(
-    "Unique variants excluded from the autosomal model:",
-    autosomal_flagged_common["variant"].nunique()
-)
 
 # ============================================================
 # Calculate eligible autosomal pathogenic allele burden
@@ -1989,6 +1990,8 @@ print(
         "invalid_q"
     ].sum()
 )
+
+
 
 # ============================================================
 # Summarise variants excluded from the model
@@ -2048,5 +2051,89 @@ print(
         ascending=False,
     )
     .head(30)
+    .to_string(index=False)
+)
+
+# ============================================================
+# Calculate autosomal Hardy-Weinberg estimates
+# ============================================================
+
+q = autosomal_allele_burden[
+    "pathogenic_allele_frequency"
+]
+
+# Frequency of individuals carrying exactly one
+# pathogenic allele.
+autosomal_allele_burden[
+    "heterozygous_carrier_frequency"
+] = (
+    2 * q * (1 - q)
+)
+
+# Frequency of individuals expected to carry two
+# pathogenic alleles under Hardy-Weinberg equilibrium.
+autosomal_allele_burden[
+    "biallelic_genotype_frequency"
+] = q ** 2
+
+# Frequency of individuals carrying at least one
+# pathogenic allele.
+autosomal_allele_burden[
+    "any_pathogenic_genotype_frequency"
+] = (
+    2 * q * (1 - q)
+    + q ** 2
+)
+
+PER_100K = 100_000
+
+autosomal_allele_burden[
+    "heterozygous_carriers_per_100k"
+] = (
+    autosomal_allele_burden[
+        "heterozygous_carrier_frequency"
+    ]
+    * PER_100K
+)
+
+autosomal_allele_burden[
+    "biallelic_genotypes_per_100k"
+] = (
+    autosomal_allele_burden[
+        "biallelic_genotype_frequency"
+    ]
+    * PER_100K
+)
+
+autosomal_allele_burden[
+    "any_pathogenic_genotype_per_100k"
+] = (
+    autosomal_allele_burden[
+        "any_pathogenic_genotype_frequency"
+    ]
+    * PER_100K
+)
+
+print(
+    "\nLargest autosomal Hardy-Weinberg estimates:"
+)
+
+print(
+    autosomal_allele_burden[
+        [
+            "GeneSymbol",
+            "PhenotypeList",
+            "population",
+            "pathogenic_allele_frequency",
+            "number_of_variants",
+            "heterozygous_carriers_per_100k",
+            "biallelic_genotypes_per_100k",
+        ]
+    ]
+    .sort_values(
+        "biallelic_genotypes_per_100k",
+        ascending=False,
+    )
+    .head(20)
     .to_string(index=False)
 )
