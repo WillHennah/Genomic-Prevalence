@@ -32,17 +32,35 @@ EXCLUDED_POPULATION_IDS = {
 }
 
 # ============================================================
-# ClinGen validity display settings
+# Validity display settings
 # ============================================================
 
-CLINGEN_VALIDITY_RANK = {
-    "Definitive": 6,
-    "Strong": 5,
-    "Moderate": 4,
-    "Limited": 3,
+VALIDITY_RANK = {
+    "Definitive": 8,
+    "Strong": 7,
+    "Moderate": 6,
+    "Supportive": 5,
+    "Limited": 4,
+    "Animal Model Only": 3,
     "Disputed": 2,
+    "Disputed Evidence": 2,
     "Refuted": 1,
-    "No supporting assertion": 0,
+    "Refuted Evidence": 1,
+    "No Known Disease Relationship": 0,
+    "No supporting assertion": -1,
+}
+
+RANK_TO_VALIDITY = {
+    8: "Definitive",
+    7: "Strong",
+    6: "Moderate",
+    5: "Supportive",
+    4: "Limited",
+    3: "Animal Model Only",
+    2: "Disputed",
+    1: "Refuted",
+    0: "No Known Disease Relationship",
+    -1: "No supporting assertion",
 }
 
 # ============================================================
@@ -77,6 +95,13 @@ FORCE_GNOMAD_REFRESH = False
 
 CLINGEN_CACHE_MAX_AGE_DAYS = 7
 CLINGEN_FILE = "clingen_gene_disease_validity.csv"
+
+# ============================================================
+# GenCC inheritance settings
+# ============================================================
+
+GENCC_FILE = "gencc_submissions.csv"
+GENCC_CACHE_MAX_AGE_DAYS = 7
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -539,7 +564,80 @@ print(
 )
 
 # ============================================================
-# Match ClinVar gene-disease relationships to ClinGen
+# Inheritance helper functions
+# ============================================================
+
+def combine_unique_values(series):
+    """
+    Combine unique non-null values into a pipe-separated string.
+    """
+
+    values = (
+        series
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+
+    if not values:
+        return pd.NA
+
+    return "|".join(sorted(values))
+
+
+def normalize_inheritance_model(label):
+    """
+    Normalize inheritance descriptions into model categories.
+    """
+
+    if pd.isna(label):
+        return "unknown"
+
+    label = str(label).strip().lower()
+
+    if "autosomal recessive" in label:
+        return "autosomal_recessive"
+
+    if "autosomal dominant" in label:
+        return "autosomal_dominant"
+
+    if "x-linked" in label or "x linked" in label:
+        return "x_linked"
+
+    if "y-linked" in label or "y linked" in label:
+        return "y_linked"
+
+    if "mitochondrial" in label:
+        return "mitochondrial"
+
+    if "semidominant" in label or "semi-dominant" in label:
+        return "semidominant"
+
+    if "digenic" in label:
+        return "digenic"
+
+    if "undetermined" in label:
+        return "unknown"
+
+    if label == "unknown":
+        return "unknown"
+
+    return "other"
+
+
+CLINGEN_MOI_LABELS = {
+    "AR": "Autosomal recessive",
+    "AD": "Autosomal dominant",
+    "XL": "X-linked",
+    "SD": "Semidominant",
+    "MT": "Mitochondrial",
+    "UD": "Undetermined",
+}
+
+# ============================================================
+# Build unique ClinVar gene-disease relationships
 # ============================================================
 
 clinvar_disease_relationships = (
@@ -556,14 +654,21 @@ clinvar_disease_relationships = (
     .copy()
 )
 
-clinvar_clingen = clinvar_disease_relationships.merge(
-    clingen,
-    on=[
-        "HGNC_ID",
-        "MONDO_ID",
-    ],
-    how="left",
-    validate="m:m",
+# ============================================================
+# Match ClinVar relationships to direct ClinGen assertions
+# ============================================================
+
+clinvar_clingen = (
+    clinvar_disease_relationships
+    .merge(
+        clingen,
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="m:m",
+    )
 )
 
 clinvar_clingen["clingen_match"] = (
@@ -571,10 +676,6 @@ clinvar_clingen["clingen_match"] = (
         "inheritance_mode"
     ].notna()
 )
-
-# ============================================================
-# Preserve individual ClinGen inheritance assertions
-# ============================================================
 
 inheritance_assertions = (
     clinvar_clingen[
@@ -599,24 +700,6 @@ inheritance_assertions = (
 )
 
 inheritance_assertions[
-    "validity_rank"
-] = (
-    inheritance_assertions[
-        "gene_disease_validity"
-    ]
-    .map(CLINGEN_VALIDITY_RANK)
-)
-
-CLINGEN_MOI_LABELS = {
-    "AR": "Autosomal recessive",
-    "AD": "Autosomal dominant",
-    "XL": "X-linked",
-    "SD": "Semidominant",
-    "MT": "Mitochondrial",
-    "UD": "Undetermined",
-}
-
-inheritance_assertions[
     "inheritance_label"
 ] = (
     inheritance_assertions[
@@ -631,8 +714,68 @@ inheritance_assertions[
 )
 
 inheritance_assertions[
+    "inheritance_model"
+] = (
+    inheritance_assertions[
+        "inheritance_label"
+    ]
+    .apply(normalize_inheritance_model)
+)
+
+inheritance_assertions[
+    "validity_rank"
+] = (
+    inheritance_assertions[
+        "gene_disease_validity"
+    ]
+    .map(VALIDITY_RANK)
+)
+
+inheritance_assertions[
     "inheritance_source"
 ] = "ClinGen"
+
+inheritance_assertions[
+    "inheritance_submitter"
+] = "ClinGen"
+
+clingen_evidence = inheritance_assertions[
+    [
+        "GeneSymbol",
+        "HGNC_ID",
+        "PhenotypeList",
+        "MONDO_ID",
+        "inheritance_label",
+        "inheritance_model",
+        "gene_disease_validity",
+        "validity_rank",
+        "inheritance_source",
+        "inheritance_submitter",
+        "clingen_classification_date",
+    ]
+].copy()
+
+clingen_evidence = clingen_evidence.rename(
+    columns={
+        "clingen_classification_date":
+            "inheritance_date",
+    }
+)
+
+clingen_evidence[
+    "source_record_id"
+] = pd.NA
+
+relationship_match_summary = (
+    clinvar_clingen[
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "clingen_match",
+        ]
+    ]
+    .drop_duplicates()
+)
 
 print("\nMatched ClinGen assertions by validity")
 print("--------------------------------------")
@@ -645,16 +788,6 @@ print(
     .to_string()
 )
 
-relationship_match_summary = (
-    clinvar_clingen[
-        [
-            "HGNC_ID",
-            "MONDO_ID",
-            "clingen_match",
-        ]
-    ]
-    .drop_duplicates()
-)
 print("\nClinVar -> ClinGen inheritance matching")
 print("---------------------------------------")
 
@@ -678,123 +811,455 @@ print(
         ]
     ).sum()
 )
+
 # ============================================================
-# Summarise ClinGen inheritance per gene-disease relationship
+# Load GenCC inheritance data
 # ============================================================
 
-def combine_unique_values(series):
-    values = (
-        series
-        .dropna()
-        .astype(str)
+gencc = pd.read_csv(
+    GENCC_FILE,
+    low_memory=False,
+)
+
+print(
+    "\nGenCC rows:",
+    f"{len(gencc):,}"
+)
+
+gencc_assertions = (
+    gencc[
+        [
+            "sgc_id",
+            "version_number",
+            "gene_curie",
+            "gene_symbol",
+            "disease_curie",
+            "disease_title",
+            "classification_title",
+            "moi_curie",
+            "moi_title",
+            "submitter_title",
+            "submitted_as_date",
+            "submitted_as_public_report_url",
+        ]
+    ]
+    .copy()
+)
+
+gencc_assertions = gencc_assertions.rename(
+    columns={
+        "gene_curie": "HGNC_ID",
+        "gene_symbol": "gencc_gene_symbol",
+        "disease_curie": "MONDO_ID",
+        "disease_title": "gencc_disease_label",
+        "classification_title":
+            "gene_disease_validity",
+        "moi_title": "inheritance_label",
+        "submitter_title":
+            "inheritance_submitter",
+        "submitted_as_date": "inheritance_date",
+        "submitted_as_public_report_url":
+            "inheritance_report_url",
+    }
+)
+
+gencc_assertions[
+    "inheritance_source"
+] = "GenCC"
+
+for column in [
+    "HGNC_ID",
+    "MONDO_ID",
+    "inheritance_label",
+    "gene_disease_validity",
+    "inheritance_submitter",
+]:
+    gencc_assertions[column] = (
+        gencc_assertions[column]
+        .astype("string")
         .str.strip()
-        .unique()
-        .tolist()
     )
 
-    if not values:
-        return pd.NA
+gencc_assertions = (
+    gencc_assertions
+    .dropna(
+        subset=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ]
+    )
+    .copy()
+)
 
-    return "|".join(sorted(values))
+gencc_assertions[
+    "version_number"
+] = pd.to_numeric(
+    gencc_assertions[
+        "version_number"
+    ],
+    errors="coerce",
+)
 
+gencc_assertions = (
+    gencc_assertions
+    .sort_values(
+        [
+            "sgc_id",
+            "version_number",
+        ]
+    )
+    .drop_duplicates(
+        subset=["sgc_id"],
+        keep="last",
+    )
+    .reset_index(drop=True)
+)
 
-clingen_inheritance_summary = (
-    clinvar_clingen
-    .groupby(
+gencc_assertions[
+    "inheritance_model"
+] = (
+    gencc_assertions[
+        "inheritance_label"
+    ]
+    .apply(normalize_inheritance_model)
+)
+
+gencc_assertions[
+    "validity_rank"
+] = (
+    gencc_assertions[
+        "gene_disease_validity"
+    ]
+    .map(VALIDITY_RANK)
+)
+
+print("\nGenCC inheritance models")
+print("------------------------")
+
+print(
+    gencc_assertions[
+        "inheritance_model"
+    ]
+    .value_counts(dropna=False)
+    .to_string()
+)
+
+gencc_non_clingen = gencc_assertions[
+    gencc_assertions[
+        "inheritance_submitter"
+    ] != "ClinGen"
+].copy()
+
+print(
+    "\nDirect ClinGen assertions:",
+    len(clingen_evidence)
+)
+
+print(
+    "GenCC assertions excluding ClinGen:",
+    len(gencc_non_clingen)
+)
+
+gencc_evidence = gencc_non_clingen[
+    [
+        "sgc_id",
+        "HGNC_ID",
+        "MONDO_ID",
+        "inheritance_label",
+        "inheritance_model",
+        "gene_disease_validity",
+        "validity_rank",
+        "inheritance_source",
+        "inheritance_submitter",
+        "inheritance_date",
+    ]
+].copy()
+
+gencc_evidence[
+    "source_record_id"
+] = gencc_evidence[
+    "sgc_id"
+]
+
+gencc_evidence = (
+    clinvar_disease_relationships[
         [
             "GeneSymbol",
             "HGNC_ID",
             "PhenotypeList",
-            "Disease_ID",
+            "MONDO_ID",
+        ]
+    ]
+    .merge(
+        gencc_evidence,
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="inner",
+        validate="m:m",
+    )
+)
+
+gencc_evidence = gencc_evidence.drop(
+    columns=["sgc_id"]
+)
+
+clinvar_gencc = (
+    clinvar_disease_relationships
+    .merge(
+        gencc_assertions[
+            [
+                "HGNC_ID",
+                "MONDO_ID",
+                "sgc_id",
+            ]
+        ],
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="m:m",
+    )
+)
+
+# ============================================================
+# Calculate GenCC coverage of ClinVar relationships
+# ============================================================
+
+gencc_relationship_coverage = (
+    clinvar_gencc[
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "sgc_id",
+        ]
+    ]
+    .groupby(
+        [
+            "HGNC_ID",
             "MONDO_ID",
         ],
         dropna=False,
         as_index=False,
     )
     .agg(
-        inheritance_mode=(
-            "inheritance_mode",
+        gencc_assertions=(
+            "sgc_id",
+            "count",
+        )
+    )
+)
+
+gencc_relationship_coverage[
+    "gencc_match"
+] = (
+    gencc_relationship_coverage[
+        "gencc_assertions"
+    ] > 0
+)
+
+print("\nClinVar -> GenCC inheritance matching")
+print("-------------------------------------")
+
+print(
+    "Unique HGNC + MONDO relationships:",
+    len(gencc_relationship_coverage)
+)
+
+print(
+    "Relationships with GenCC assertions:",
+    gencc_relationship_coverage[
+        "gencc_match"
+    ].sum()
+)
+
+print(
+    "Relationships without GenCC assertions:",
+    (
+        ~gencc_relationship_coverage[
+            "gencc_match"
+        ]
+    ).sum()
+)
+
+# ============================================================
+# Calculate combined inheritance-source coverage
+# ============================================================
+
+clingen_coverage = (
+    relationship_match_summary[
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "clingen_match",
+        ]
+    ]
+    .drop_duplicates()
+)
+
+combined_coverage = (
+    clingen_coverage
+    .merge(
+        gencc_relationship_coverage[
+            [
+                "HGNC_ID",
+                "MONDO_ID",
+                "gencc_match",
+            ]
+        ],
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="outer",
+    )
+)
+
+combined_coverage[
+    "clingen_match"
+] = (
+    combined_coverage[
+        "clingen_match"
+    ]
+    .fillna(False)
+)
+
+combined_coverage[
+    "gencc_match"
+] = (
+    combined_coverage[
+        "gencc_match"
+    ]
+    .fillna(False)
+)
+
+gencc_added_coverage = (
+    ~combined_coverage["clingen_match"]
+    & combined_coverage["gencc_match"]
+)
+
+print(
+    "\nRelationships added by GenCC beyond direct ClinGen:",
+    gencc_added_coverage.sum()
+)
+
+print(
+    "Relationships covered by either source:",
+    (
+        combined_coverage["clingen_match"]
+        | combined_coverage["gencc_match"]
+    ).sum()
+)
+
+# ============================================================
+# Build unified inheritance evidence table
+# ============================================================
+
+inheritance_evidence = pd.concat(
+    [
+        clingen_evidence,
+        gencc_evidence,
+    ],
+    ignore_index=True,
+    sort=False,
+)
+
+inheritance_evidence = (
+    inheritance_evidence
+    .drop_duplicates(
+        subset=[
+            "HGNC_ID",
+            "MONDO_ID",
+            "inheritance_model",
+            "gene_disease_validity",
+            "inheritance_submitter",
+        ]
+    )
+    .reset_index(drop=True)
+)
+
+# ============================================================
+# Summarise inheritance evidence by disease and model
+# ============================================================
+
+inheritance_model_summary = (
+    inheritance_evidence
+    .groupby(
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "MONDO_ID",
+            "inheritance_model",
+            "inheritance_label",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        best_validity_rank=(
+            "validity_rank",
+            "max",
+        ),
+        evidence_sources=(
+            "inheritance_submitter",
             combine_unique_values,
         ),
-        gene_disease_validity=(
+        validity_evidence=(
             "gene_disease_validity",
             combine_unique_values,
         ),
-        clingen_classification_date=(
-            "clingen_classification_date",
-            combine_unique_values,
-        ),
-        clingen_gcep=(
-            "clingen_gcep",
-            combine_unique_values,
+        assertion_count=(
+            "gene_disease_validity",
+            "size",
         ),
     )
 )
 
-def classify_inheritance_mode(moi):
-    """
-    Convert ClinGen MOI codes into model categories.
-
-    Multiple distinct modes are retained as ambiguous/multiple.
-    """
-
-    if pd.isna(moi):
-        return "unknown"
-
-    modes = set(
-        str(moi).split("|")
-    )
-
-    if modes == {"AR"}:
-        return "autosomal_recessive"
-
-    if modes == {"AD"}:
-        return "autosomal_dominant"
-
-    if modes == {"XL"}:
-        return "x_linked"
-
-    if modes == {"MT"}:
-        return "mitochondrial"
-
-    if modes == {"SD"}:
-        return "semidominant"
-
-    if modes == {"UD"}:
-        return "undetermined"
-
-    return "multiple"
-
-clingen_inheritance_summary[
-    "inheritance_model"
+inheritance_model_summary[
+    "best_validity"
 ] = (
-    clingen_inheritance_summary[
-        "inheritance_mode"
+    inheritance_model_summary[
+        "best_validity_rank"
     ]
-    .apply(classify_inheritance_mode)
+    .map(RANK_TO_VALIDITY)
 )
 
-clingen_inheritance_summary[
-    "inheritance_source"
-] = np.where(
-    clingen_inheritance_summary[
-        "inheritance_mode"
-    ].notna(),
-    "ClinGen",
-    pd.NA,
+# Flag inheritance models for which evidence sources report
+# more than one validity classification.
+inheritance_model_summary[
+    "evidence_conflict"
+] = (
+    inheritance_model_summary[
+        "validity_evidence"
+    ]
+    .fillna("")
+    .str.contains(
+        r"\|",
+        regex=True,
+    )
 )
 
-print("\nClinVar relationships by ClinGen inheritance model")
-print("---------------------------------------------------")
+print("\nUnified inheritance model coverage")
+print("----------------------------------")
 
 print(
-    clingen_inheritance_summary[
+    inheritance_model_summary[
         "inheritance_model"
     ]
     .value_counts(
         dropna=False
     )
     .to_string()
+)
+
+print(
+    "\nInheritance model rows with conflicting validity evidence:",
+    inheritance_model_summary[
+        "evidence_conflict"
+    ].sum()
 )
 
 # ============================================================
