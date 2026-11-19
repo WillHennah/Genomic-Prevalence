@@ -751,6 +751,36 @@ pathovar.to_csv("Pathogenic_Variants_temp.csv", index=False)
 ## Create Variant List from ClinVar Data
 
 pvars = pd.read_csv("Pathogenic_Variants_temp.csv", delimiter=",")
+
+pvars["PositionVCF"] = pd.to_numeric(
+    pvars["PositionVCF"],
+    errors="coerce",
+)
+
+# ============================================================
+# Exclude ClinVar rows without a usable GRCh38 VCF allele
+# ============================================================
+
+valid_vcf_mask = (
+    pvars["PositionVCF"].notna()
+    & (pvars["PositionVCF"] > 0)
+    & pvars["ReferenceAlleleVCF"].notna()
+    & pvars["AlternateAlleleVCF"].notna()
+)
+
+invalid_vcf_rows = pvars[
+    ~valid_vcf_mask
+].copy()
+
+print(
+    "\nClinVar relationships without a usable VCF allele:",
+    len(invalid_vcf_rows)
+)
+
+pvars = pvars[
+    valid_vcf_mask
+].copy()
+
 pvars['variant'] = pvars['Chromosome'].astype(str) + '-' + pvars['PositionVCF'].astype(str) + '-' + pvars['ReferenceAlleleVCF'] + '-' + pvars['AlternateAlleleVCF']
 
 pvars.to_csv("Pathogenic_Variants.csv", index=False)
@@ -1508,7 +1538,7 @@ inheritance_model_summary[
 # Flag inheritance models for which evidence sources report
 # more than one validity classification.
 inheritance_model_summary[
-    "evidence_conflict"
+    "validity_variation"
 ] = (
     inheritance_model_summary[
         "validity_evidence"
@@ -1534,10 +1564,57 @@ print(
 )
 
 print(
-    "\nInheritance model rows with conflicting validity evidence:",
+    "\nInheritance model rows with variation in validity evidence:",
     inheritance_model_summary[
-        "evidence_conflict"
+        "validity_variation"
     ].sum()
+)
+
+# ============================================================
+# Summarise inheritance-model agreement per gene-disease pair
+# ============================================================
+
+inheritance_relationship_summary = (
+    inheritance_model_summary
+    .groupby(
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        asserted_inheritance_models=(
+            "inheritance_model",
+            combine_unique_values,
+        ),
+        number_of_asserted_models=(
+            "inheritance_model",
+            "nunique",
+        ),
+    )
+)
+
+inheritance_relationship_summary[
+    "multiple_inheritance_models"
+] = (
+    inheritance_relationship_summary[
+        "number_of_asserted_models"
+    ] > 1
+)
+
+inheritance_model_summary = (
+    inheritance_model_summary
+    .merge(
+        inheritance_relationship_summary,
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="m:1",
+    )
 )
 
 # ============================================================
@@ -2482,16 +2559,6 @@ print(
     f"{failure_count:,}"
 )
 
-print("\nQuery status:")
-if gnomad_query_log.empty:
-    print("No variants were processed.")
-else:
-    print(
-        gnomad_query_log.to_string(
-            index=False
-        )
-    )
-
 print("\nSelected frequency sources:")
 if gnomad_frequency_selected.empty:
     print("No usable population frequencies.")
@@ -2516,21 +2583,6 @@ print(
     "Selected population rows:",
     len(gnomad_frequency_selected),
 )
-
-if not gnomad_frequency_selected.empty:
-    print("\nSelected gnomAD frequencies:")
-    print(
-        gnomad_frequency_selected[
-            [
-                "variant_id",
-                "population_id",
-                "source",
-                "ac",
-                "an",
-                "af",
-            ]
-        ].to_string(index=False)
-    )
 
 # ============================================================
 # Join ClinVar annotations to selected gnomAD frequencies
@@ -2570,7 +2622,10 @@ frequency_analysis = clinvar_gnomad[
     [
         "variant",
         "GeneSymbol",
+        "HGNC_ID",
         "PhenotypeList",
+        "Disease_ID",
+        "MONDO_ID",
         "Chromosome",
         "population_id",
         "source",
@@ -2660,7 +2715,8 @@ print(
 duplicate_mask = frequency_analysis.duplicated(
     subset=[
         "variant",
-        "GeneSymbol",
+        "HGNC_ID",
+        "Disease_ID",
         "PhenotypeList",
         "population",
         "sex",
@@ -2677,41 +2733,6 @@ print(
     "variant/gene/phenotype/population/sex rows:",
     len(duplicate_rows)
 )
-
-if not frequency_analysis.empty:
-
-    example_variant = (
-        frequency_analysis["variant"]
-        .iloc[0]
-    )
-
-    print(
-        f"\nExample joined data for "
-        f"{example_variant}"
-    )
-
-    example_data = frequency_analysis[
-        frequency_analysis["variant"]
-        == example_variant
-    ][
-        [
-            "GeneSymbol",
-            "PhenotypeList",
-            "Chromosome",
-            "population",
-            "sex",
-            "source",
-            "ac",
-            "an",
-            "af",
-        ]
-    ]
-
-    print(
-        example_data.to_string(
-            index=False
-        )
-    )
 
 # ============================================================
 # Build ClinVar variant evidence table
@@ -3198,7 +3219,10 @@ autosomal_allele_burden = (
     .groupby(
         [
             "GeneSymbol",
+            "HGNC_ID",
             "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
             "Chromosome",
             "population",
         ],
@@ -3253,7 +3277,10 @@ flagged_common_summary = (
     .groupby(
         [
             "GeneSymbol",
+            "HGNC_ID",
             "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
             "population",
         ],
         as_index=False,
@@ -3276,7 +3303,10 @@ autosomal_allele_burden = (
         flagged_common_summary,
         on=[
             "GeneSymbol",
+            "HGNC_ID",
             "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
             "population",
         ],
         how="outer",
@@ -3365,26 +3395,251 @@ autosomal_allele_burden[
     * PER_100K
 )
 
-print(
-    "\nLargest autosomal Hardy-Weinberg estimates:"
+# ============================================================
+# Build inheritance-aware autosomal prevalence results
+# ============================================================
+
+autosomal_prevalence_base = (
+    autosomal_allele_burden[
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+            "Chromosome",
+            "population",
+            "pathogenic_allele_frequency",
+            "number_of_variants",
+            "minimum_an",
+            "heterozygous_carriers_per_100k",
+            "biallelic_genotypes_per_100k",
+            "any_pathogenic_genotype_per_100k",
+        ]
+    ]
+    .copy()
+)
+
+autosomal_recessive_results = (
+    autosomal_prevalence_base.copy()
+)
+
+autosomal_recessive_results[
+    "inheritance_model"
+] = "autosomal_recessive"
+
+autosomal_recessive_results[
+    "inheritance_label"
+] = "Autosomal recessive"
+
+autosomal_recessive_results[
+    "estimated_genetic_prevalence_per_100k"
+] = (
+    autosomal_recessive_results[
+        "biallelic_genotypes_per_100k"
+    ]
+)
+
+autosomal_dominant_results = (
+    autosomal_prevalence_base.copy()
+)
+
+autosomal_dominant_results[
+    "inheritance_model"
+] = "autosomal_dominant"
+
+autosomal_dominant_results[
+    "inheritance_label"
+] = "Autosomal dominant"
+
+autosomal_dominant_results[
+    "estimated_genetic_prevalence_per_100k"
+] = (
+    autosomal_dominant_results[
+        "any_pathogenic_genotype_per_100k"
+    ]
+)
+
+autosomal_prevalence_results = pd.concat(
+    [
+        autosomal_recessive_results,
+        autosomal_dominant_results,
+    ],
+    ignore_index=True,
+)
+
+# ============================================================
+# Prepare autosomal inheritance evidence for prevalence results
+# ============================================================
+
+# ============================================================
+# Prepare model-specific inheritance evidence
+# ============================================================
+
+autosomal_inheritance_evidence = (
+    inheritance_model_summary[
+        inheritance_model_summary[
+            "inheritance_model"
+        ].isin(
+            [
+                "autosomal_recessive",
+                "autosomal_dominant",
+            ]
+        )
+    ][
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "inheritance_model",
+            "best_validity",
+            "best_validity_rank",
+            "validity_evidence",
+            "evidence_sources",
+            "assertion_count",
+            "validity_variation",
+        ]
+    ]
+    .drop_duplicates()
+    .copy()
+)
+
+# Add evidence specific to the calculated inheritance model.
+autosomal_prevalence_results = (
+    autosomal_prevalence_results
+    .merge(
+        autosomal_inheritance_evidence,
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+            "inheritance_model",
+        ],
+        how="left",
+        validate="m:1",
+    )
+)
+
+autosomal_prevalence_results = (
+    autosomal_prevalence_results
+    .merge(
+        inheritance_relationship_summary,
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="m:1",
+    )
+)
+
+no_inheritance_evidence = (
+    autosomal_prevalence_results[
+        "best_validity"
+    ].isna()
+)
+
+autosomal_prevalence_results.loc[
+    no_inheritance_evidence,
+    "best_validity",
+] = "No supporting assertion"
+
+autosomal_prevalence_results.loc[
+    no_inheritance_evidence,
+    "best_validity_rank",
+] = VALIDITY_RANK[
+    "No supporting assertion"
+]
+
+autosomal_prevalence_results.loc[
+    no_inheritance_evidence,
+    "validity_evidence",
+] = "No supporting assertion"
+
+autosomal_prevalence_results.loc[
+    no_inheritance_evidence,
+    "assertion_count",
+] = 0
+
+autosomal_prevalence_results.loc[
+    no_inheritance_evidence,
+    "evidence_sources",
+] = "No supporting source"
+
+autosomal_prevalence_results.loc[
+    no_inheritance_evidence,
+    "validity_variation",
+] = False
+
+autosomal_prevalence_results[
+    "display_priority"
+] = (
+    autosomal_prevalence_results[
+        "best_validity_rank"
+    ]
+)
+
+no_relationship_inheritance = (
+    autosomal_prevalence_results[
+        "asserted_inheritance_models"
+    ].isna()
+)
+
+autosomal_prevalence_results.loc[
+    no_relationship_inheritance,
+    "asserted_inheritance_models",
+] = "none"
+
+autosomal_prevalence_results.loc[
+    no_relationship_inheritance,
+    "number_of_asserted_models",
+] = 0
+
+autosomal_prevalence_results.loc[
+    no_relationship_inheritance,
+    "multiple_inheritance_models",
+] = False
+
+print("\nHOGA1 inheritance-aware prevalence example")
+print("------------------------------------------")
+
+hoga1_example = autosomal_prevalence_results[
+    (
+        autosomal_prevalence_results[
+            "GeneSymbol"
+        ] == "HOGA1"
+    )
+    & (
+        autosomal_prevalence_results[
+            "MONDO_ID"
+        ] == "MONDO:0013327"
+    )
+    & (
+        autosomal_prevalence_results[
+            "population"
+        ] == "asj"
+    )
+].copy()
+
+hoga1_example = hoga1_example.sort_values(
+    "display_priority",
+    ascending=False,
 )
 
 print(
-    autosomal_allele_burden[
+    hoga1_example[
         [
             "GeneSymbol",
             "PhenotypeList",
             "population",
-            "pathogenic_allele_frequency",
-            "number_of_variants",
-            "heterozygous_carriers_per_100k",
-            "biallelic_genotypes_per_100k",
+            "inheritance_label",
+            "estimated_genetic_prevalence_per_100k",
+            "best_validity",
+            "validity_evidence",
+            "evidence_sources",
+            "assertion_count",
+            "validity_variation",
+            "asserted_inheritance_models",
+            "number_of_asserted_models",
+            "multiple_inheritance_models",
         ]
-    ]
-    .sort_values(
-        "biallelic_genotypes_per_100k",
-        ascending=False,
-    )
-    .head(20)
-    .to_string(index=False)
+    ].to_string(index=False)
 )
