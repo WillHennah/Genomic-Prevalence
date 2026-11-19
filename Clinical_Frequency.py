@@ -33,6 +33,15 @@ EXCLUDED_POPULATION_IDS = {
 }
 
 # ============================================================
+# GRCh38 pseudoautosomal regions
+# ============================================================
+
+GRCH38_PAR_INTERVALS = [
+    (10_001, 2_781_479),
+    (155_701_383, 156_030_895),
+]
+
+# ============================================================
 # Validity display settings
 # ============================================================
 
@@ -113,6 +122,12 @@ GENCC_URL = (
 )
 GENCC_CACHE_MAX_AGE_DAYS = 7
 GENCC_METADATA_FILE = "gencc_download_metadata.json"
+
+X_LINKED_MODELS = {
+    "x_linked_recessive",
+    "x_linked_dominant",
+    "x_linked_unspecified",
+}
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -456,6 +471,22 @@ def download_clinvar(url, filepath):
             os.remove(temp_file)
 
     print("Download complete.")
+
+def is_grch38_par(position):
+    """
+    Return True when an X-chromosome GRCh38 position lies
+    within PAR1 or PAR2.
+    """
+
+    if pd.isna(position):
+        return pd.NA
+
+    position = int(position)
+
+    return any(
+        start <= position <= end
+        for start, end in GRCH38_PAR_INTERVALS
+    )
 
 if os.path.exists(output_file):
 
@@ -909,8 +940,14 @@ def normalize_inheritance_model(label):
     if "autosomal dominant" in label:
         return "autosomal_dominant"
 
+    if "x-linked recessive" in label or "x linked recessive" in label:
+        return "x_linked_recessive"
+
+    if "x-linked dominant" in label or "x linked dominant" in label:
+        return "x_linked_dominant"
+
     if "x-linked" in label or "x linked" in label:
-        return "x_linked"
+        return "x_linked_unspecified"
 
     if "y-linked" in label or "y linked" in label:
         return "y_linked"
@@ -1614,6 +1651,34 @@ inheritance_model_summary = (
         ],
         how="left",
         validate="m:1",
+    )
+)
+
+x_linked_relationships = (
+    inheritance_model_summary[
+        inheritance_model_summary[
+            "inheritance_model"
+        ].isin(X_LINKED_MODELS)
+    ][
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+        ]
+    ]
+    .drop_duplicates()
+)
+
+x_test_candidates = (
+    pvars[
+        pvars["Chromosome"].astype(str) == "X"
+    ]
+    .merge(
+        x_linked_relationships,
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="inner",
     )
 )
 
@@ -2345,6 +2410,47 @@ if GNOMAD_TEST_LIMIT is None:
 else:
     variants_to_process = all_variants[:GNOMAD_TEST_LIMIT]
 
+
+
+
+
+# During development, ensure that a few curated X-linked
+# variants are represented in the test set.
+if GNOMAD_TEST_LIMIT is not None:
+
+    x_test_variants = (
+        x_test_candidates[
+            "variant"
+        ]
+        .dropna()
+        .astype("string")
+        .drop_duplicates()
+        .head(15)
+        .tolist()
+    )
+
+    variants_to_process = list(
+        dict.fromkeys(
+            variants_to_process
+            + x_test_variants
+        )
+    )
+
+# Check which X-linked development candidates are already cached.
+cached_x_status = load_cached_query_status(
+    variant_ids=(
+        x_test_candidates[
+            "variant"
+        ]
+        .dropna()
+        .astype("string")
+        .drop_duplicates()
+        .tolist()
+    )
+)
+
+
+
 print(
     f"Processing {len(variants_to_process):,} "
     "gnomAD variants."
@@ -2378,12 +2484,6 @@ with requests.Session() as session:
             and cache_is_current(cached_status)
         ):
             cached_count += 1
-
-            print(
-                f"[{number}/{len(variants_to_process)}] "
-                f"Cached: {variant_id} "
-                f"({cached_status['status']})"
-            )
 
             query_log.append(
                 {
@@ -2627,6 +2727,7 @@ frequency_analysis = clinvar_gnomad[
         "Disease_ID",
         "MONDO_ID",
         "Chromosome",
+        "PositionVCF",
         "population_id",
         "source",
         "ac",
@@ -3469,10 +3570,6 @@ autosomal_prevalence_results = pd.concat(
 )
 
 # ============================================================
-# Prepare autosomal inheritance evidence for prevalence results
-# ============================================================
-
-# ============================================================
 # Prepare model-specific inheritance evidence
 # ============================================================
 
@@ -3642,4 +3739,463 @@ print(
             "multiple_inheritance_models",
         ]
     ].to_string(index=False)
+)
+
+# ============================================================
+# Calculate X-chromosome pathogenic allele burden
+# ============================================================
+
+x_frequency_analysis = frequency_analysis[
+    frequency_analysis["Chromosome"].astype(str) == "X"
+].copy()
+
+x_frequency_analysis[
+    "is_par"
+] = (
+    x_frequency_analysis[
+        "PositionVCF"
+    ]
+    .apply(is_grch38_par)
+)
+
+print(
+    "X observations in PAR:",
+    x_frequency_analysis[
+        "is_par"
+    ].fillna(False).sum()
+)
+
+print(
+    "X observations outside PAR:",
+    (
+        ~x_frequency_analysis[
+            "is_par"
+        ].fillna(True)
+    ).sum()
+)
+
+print(
+    "\nX-chromosome variant/population observations:",
+    len(x_frequency_analysis)
+)
+
+print(
+    "Unique X-chromosome variants:",
+    x_frequency_analysis["variant"].nunique()
+)
+
+x_frequency_analysis = x_frequency_analysis[
+    x_frequency_analysis["sex"].isin(
+        [
+            "XX",
+            "XY",
+        ]
+    )
+].copy()
+
+x_model_data = x_frequency_analysis[
+    x_frequency_analysis["variant"].isin(
+        included_variant_ids
+    )
+    & (
+        x_frequency_analysis[
+            "is_par"
+        ] == False
+    )
+].copy()
+
+x_flagged_common = x_frequency_analysis[
+    x_frequency_analysis["variant"].isin(
+        excluded_common_variant_ids
+    )
+    & (
+        x_frequency_analysis[
+            "is_par"
+        ] == False
+    )
+].copy()
+
+x_allele_burden = (
+    x_model_data
+    .groupby(
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+            "population",
+            "sex",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        pathogenic_allele_frequency=(
+            "af",
+            "sum",
+        ),
+        number_of_variants=(
+            "variant",
+            "nunique",
+        ),
+        minimum_an=(
+            "an",
+            "min",
+        ),
+    )
+)
+
+x_allele_burden[
+    "invalid_q"
+] = (
+    x_allele_burden[
+        "pathogenic_allele_frequency"
+    ] > 1
+)
+
+print(
+    "\nX-chromosome combinations with q > 1:",
+    x_allele_burden["invalid_q"].sum()
+)
+
+q_x = x_allele_burden[
+    "pathogenic_allele_frequency"
+]
+
+x_allele_burden[
+    "xy_pathogenic_genotype_frequency"
+] = np.where(
+    x_allele_burden["sex"] == "XY",
+    q_x,
+    np.nan,
+)
+
+x_allele_burden[
+    "xx_heterozygous_frequency"
+] = np.where(
+    x_allele_burden["sex"] == "XX",
+    2 * q_x * (1 - q_x),
+    np.nan,
+)
+
+x_allele_burden[
+    "xx_biallelic_genotype_frequency"
+] = np.where(
+    x_allele_burden["sex"] == "XX",
+    q_x ** 2,
+    np.nan,
+)
+
+x_allele_burden[
+    "xx_any_pathogenic_genotype_frequency"
+] = np.where(
+    x_allele_burden["sex"] == "XX",
+    (
+        2 * q_x * (1 - q_x)
+        + q_x ** 2
+    ),
+    np.nan,
+)
+
+x_allele_burden[
+    "xy_pathogenic_genotypes_per_100k"
+] = (
+    x_allele_burden[
+        "xy_pathogenic_genotype_frequency"
+    ]
+    * PER_100K
+)
+
+x_allele_burden[
+    "xx_heterozygotes_per_100k"
+] = (
+    x_allele_burden[
+        "xx_heterozygous_frequency"
+    ]
+    * PER_100K
+)
+
+x_allele_burden[
+    "xx_biallelic_genotypes_per_100k"
+] = (
+    x_allele_burden[
+        "xx_biallelic_genotype_frequency"
+    ]
+    * PER_100K
+)
+
+x_allele_burden[
+    "xx_any_pathogenic_genotype_per_100k"
+] = (
+    x_allele_burden[
+        "xx_any_pathogenic_genotype_frequency"
+    ]
+    * PER_100K
+)
+
+
+
+# ============================================================
+# Build inheritance-aware X-linked results
+# ============================================================
+
+x_prevalence_results = x_allele_burden[
+    [
+        "GeneSymbol",
+        "HGNC_ID",
+        "PhenotypeList",
+        "Disease_ID",
+        "MONDO_ID",
+        "population",
+        "sex",
+        "pathogenic_allele_frequency",
+        "number_of_variants",
+        "minimum_an",
+        "xy_pathogenic_genotypes_per_100k",
+        "xx_heterozygotes_per_100k",
+        "xx_biallelic_genotypes_per_100k",
+        "xx_any_pathogenic_genotype_per_100k",
+    ]
+].copy()
+
+x_inheritance_evidence = (
+    inheritance_model_summary[
+        inheritance_model_summary[
+            "inheritance_model"
+        ].isin(X_LINKED_MODELS)
+    ][
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "inheritance_model",
+            "inheritance_label",
+            "best_validity",
+            "best_validity_rank",
+            "validity_evidence",
+            "evidence_sources",
+            "assertion_count",
+            "validity_variation",
+        ]
+    ]
+    .drop_duplicates()
+    .copy()
+)
+# ============================================================
+# Build X-linked prevalence/genotype result table
+# ============================================================
+
+x_prevalence_results = x_allele_burden[
+    [
+        "GeneSymbol",
+        "HGNC_ID",
+        "PhenotypeList",
+        "Disease_ID",
+        "MONDO_ID",
+        "population",
+        "sex",
+        "pathogenic_allele_frequency",
+        "number_of_variants",
+        "minimum_an",
+        "xy_pathogenic_genotypes_per_100k",
+        "xx_heterozygotes_per_100k",
+        "xx_biallelic_genotypes_per_100k",
+        "xx_any_pathogenic_genotype_per_100k",
+    ]
+].copy()
+
+x_inheritance_evidence = (
+    inheritance_model_summary[
+        inheritance_model_summary[
+            "inheritance_model"
+        ].isin(
+            [
+                "x_linked_recessive",
+                "x_linked_dominant",
+                "x_linked_unspecified",
+            ]
+        )
+    ][
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "inheritance_model",
+            "inheritance_label",
+            "best_validity",
+            "best_validity_rank",
+            "validity_evidence",
+            "evidence_sources",
+            "assertion_count",
+            "validity_variation",
+        ]
+    ]
+    .drop_duplicates()
+    .copy()
+)
+
+x_prevalence_results = (
+    x_prevalence_results
+    .merge(
+        x_inheritance_evidence,
+        on=[
+            "HGNC_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="m:m",
+    )
+)
+
+x_prevalence_results[
+    "estimated_genetic_prevalence_per_100k"
+] = np.nan
+
+x_prevalence_results[
+    "prevalence_interpretation"
+] = "Genotype frequencies only"
+
+xy_mask = (
+    x_prevalence_results["sex"] == "XY"
+)
+
+x_prevalence_results.loc[
+    xy_mask,
+    "estimated_genetic_prevalence_per_100k",
+] = x_prevalence_results.loc[
+    xy_mask,
+    "xy_pathogenic_genotypes_per_100k",
+]
+
+x_prevalence_results.loc[
+    xy_mask,
+    "prevalence_interpretation",
+] = "Observed hemizygous pathogenic genotype frequency"
+
+xx_recessive_mask = (
+    (x_prevalence_results["sex"] == "XX")
+    & (
+        x_prevalence_results[
+            "inheritance_model"
+        ] == "x_linked_recessive"
+    )
+)
+
+x_prevalence_results.loc[
+    xx_recessive_mask,
+    "estimated_genetic_prevalence_per_100k",
+] = x_prevalence_results.loc[
+    xx_recessive_mask,
+    "xx_biallelic_genotypes_per_100k",
+]
+
+x_prevalence_results.loc[
+    xx_recessive_mask,
+    "prevalence_interpretation",
+] = "Expected biallelic pathogenic genotype frequency"
+
+xx_dominant_mask = (
+    (x_prevalence_results["sex"] == "XX")
+    & (
+        x_prevalence_results[
+            "inheritance_model"
+        ] == "x_linked_dominant"
+    )
+)
+
+x_prevalence_results.loc[
+    xx_dominant_mask,
+    "estimated_genetic_prevalence_per_100k",
+] = x_prevalence_results.loc[
+    xx_dominant_mask,
+    "xx_any_pathogenic_genotype_per_100k",
+]
+
+x_prevalence_results.loc[
+    xx_dominant_mask,
+    "prevalence_interpretation",
+] = "Expected frequency carrying at least one pathogenic allele"
+
+no_x_inheritance_evidence = (
+    x_prevalence_results[
+        "inheritance_model"
+    ].isna()
+)
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "inheritance_model",
+] = "x_linked_unannotated"
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "inheritance_label",
+] = "No supporting X-linked assertion"
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "best_validity",
+] = "No supporting assertion"
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "best_validity_rank",
+] = VALIDITY_RANK[
+    "No supporting assertion"
+]
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "validity_evidence",
+] = "No supporting assertion"
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "evidence_sources",
+] = "No supporting source"
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "assertion_count",
+] = 0
+
+x_prevalence_results.loc[
+    no_x_inheritance_evidence,
+    "validity_variation",
+] = False
+
+print("\nKDM5C inheritance-aware X-linked example")
+print("----------------------------------------")
+
+kdm5c_example = x_prevalence_results[
+    (
+        x_prevalence_results[
+            "GeneSymbol"
+        ] == "KDM5C"
+    )
+    & (
+        x_prevalence_results[
+            "population"
+        ] == "overall"
+    )
+].copy()
+
+print(
+    kdm5c_example[
+        [
+            "GeneSymbol",
+            "PhenotypeList",
+            "sex",
+            "inheritance_label",
+            "pathogenic_allele_frequency",
+            "xy_pathogenic_genotypes_per_100k",
+            "xx_heterozygotes_per_100k",
+            "xx_biallelic_genotypes_per_100k",
+            "estimated_genetic_prevalence_per_100k",
+            "prevalence_interpretation",
+            "best_validity",
+            "validity_evidence",
+            "evidence_sources",
+        ]
+    ]
+    .to_string(index=False)
 )
