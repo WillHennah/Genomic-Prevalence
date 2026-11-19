@@ -6,6 +6,7 @@ import pandas as pd
 import requests
 import time
 import re
+import json
 import random
 import sqlite3
 
@@ -93,15 +94,25 @@ FORCE_GNOMAD_REFRESH = False
 # ClinGen inheritance settings
 # ============================================================
 
-CLINGEN_CACHE_MAX_AGE_DAYS = 7
 CLINGEN_FILE = "clingen_gene_disease_validity.csv"
+CLINGEN_URL = (
+    "https://search.clinicalgenome.org/"
+    "kb/gene-validity/download"
+)
+CLINGEN_CACHE_MAX_AGE_DAYS = 7
+
 
 # ============================================================
 # GenCC inheritance settings
 # ============================================================
 
 GENCC_FILE = "gencc_submissions.csv"
+GENCC_URL = (
+    "https://thegencc.org/download/action/"
+    "submissions-export-csv?format=new"
+)
 GENCC_CACHE_MAX_AGE_DAYS = 7
+GENCC_METADATA_FILE = "gencc_download_metadata.json"
 
 # ------------------------------------------------------------
 # Download latest ClinVar data
@@ -122,6 +133,269 @@ def file_age_days(filepath):
     current_time = time.time()
 
     return (current_time - modified_time) / (60 * 60 * 24)
+
+def download_file(url, filepath, timeout=120):
+    """
+    Safely download a file, replacing the existing copy only
+    after the complete download succeeds.
+    """
+
+    print(f"Downloading {filepath}...")
+
+    response = requests.get(
+        url,
+        stream=True,
+        timeout=timeout,
+    )
+
+    response.raise_for_status()
+
+    temp_file = filepath + ".tmp"
+
+    try:
+        with open(temp_file, "wb") as file_handle:
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
+                if chunk:
+                    file_handle.write(chunk)
+
+        os.replace(
+            temp_file,
+            filepath,
+        )
+
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    print(
+        f"Download complete: {filepath}"
+    )
+
+def ensure_clingen_file():
+    """
+    Ensure a reasonably recent ClinGen Gene-Disease Validity
+    CSV is available locally.
+    """
+
+    if os.path.exists(CLINGEN_FILE):
+
+        age_days = file_age_days(
+            CLINGEN_FILE
+        )
+
+        print(
+            f"Existing ClinGen file is "
+            f"{age_days:.1f} days old."
+        )
+
+        if age_days < CLINGEN_CACHE_MAX_AGE_DAYS:
+            print(
+                "Using existing ClinGen file."
+            )
+            return
+
+        print(
+            "ClinGen file is at least "
+            f"{CLINGEN_CACHE_MAX_AGE_DAYS} "
+            "days old. Updating..."
+        )
+
+    else:
+
+        print(
+            "No existing ClinGen file found."
+        )
+
+    download_file(
+        CLINGEN_URL,
+        CLINGEN_FILE,
+    )
+
+def load_gencc_metadata():
+    """
+    Load saved GenCC download metadata.
+    """
+
+    if not os.path.exists(
+        GENCC_METADATA_FILE
+    ):
+        return {}
+
+    try:
+        with open(
+            GENCC_METADATA_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file_handle:
+            return json.load(file_handle)
+
+    except (
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return {}
+
+def save_gencc_metadata(metadata):
+    """
+    Save GenCC download metadata.
+    """
+
+    with open(
+        GENCC_METADATA_FILE,
+        "w",
+        encoding="utf-8",
+    ) as file_handle:
+        json.dump(
+            metadata,
+            file_handle,
+            indent=2,
+        )
+
+def ensure_gencc_file():
+    """
+    Ensure a current GenCC new-format submissions CSV
+    is available locally.
+
+    Uses the server ETag when possible so unchanged files
+    do not need to be downloaded again.
+    """
+
+    metadata = load_gencc_metadata()
+
+    if os.path.exists(GENCC_FILE):
+
+        downloaded_at = metadata.get(
+            "downloaded_at"
+        )
+
+        if downloaded_at:
+
+            try:
+                downloaded_time = (
+                    datetime.fromisoformat(
+                        downloaded_at
+                    )
+                )
+
+                if downloaded_time.tzinfo is None:
+                    downloaded_time = (
+                        downloaded_time.replace(
+                            tzinfo=timezone.utc
+                        )
+                    )
+
+                age = (
+                    datetime.now(timezone.utc)
+                    - downloaded_time
+                )
+
+                if age.total_seconds() < (
+                    GENCC_CACHE_MAX_AGE_DAYS
+                    * 24
+                    * 60
+                    * 60
+                ):
+
+                    print(
+                        "Using existing GenCC file."
+                    )
+
+                    return
+
+            except ValueError:
+                pass
+
+    headers = {}
+
+    saved_etag = metadata.get("etag")
+
+    if saved_etag:
+        headers["If-None-Match"] = saved_etag
+
+    # If there is no local file, force a normal download.
+    if not os.path.exists(GENCC_FILE):
+        headers = {}
+
+    print(
+        "Checking GenCC reference data..."
+    )
+
+    response = requests.get(
+        GENCC_URL,
+        headers=headers,
+        stream=True,
+        timeout=120,
+    )
+
+    # GenCC explicitly uses HTTP 304 when our ETag
+    # matches the current release.
+    if response.status_code == 304:
+
+        metadata[
+            "downloaded_at"
+        ] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        save_gencc_metadata(
+            metadata
+        )
+
+        print(
+            "GenCC data have not changed. "
+            "Using existing file."
+        )
+
+        return
+
+    response.raise_for_status()
+
+    temp_file = GENCC_FILE + ".tmp"
+
+    try:
+
+        with open(
+            temp_file,
+            "wb",
+        ) as file_handle:
+
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
+                if chunk:
+                    file_handle.write(chunk)
+
+        os.replace(
+            temp_file,
+            GENCC_FILE,
+        )
+
+    finally:
+
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    new_metadata = {
+        "etag": response.headers.get(
+            "ETag"
+        ),
+        "last_modified": response.headers.get(
+            "Last-Modified"
+        ),
+        "downloaded_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    save_gencc_metadata(
+        new_metadata
+    )
+
+    print(
+        "GenCC reference data updated."
+    )
 
 def cache_is_current(
     cached_status,
@@ -485,6 +759,8 @@ pvars.to_csv("Pathogenic_Variants.csv", index=False)
 # Load ClinGen Gene-Disease Validity data
 # ============================================================
 
+ensure_clingen_file()
+
 clingen = pd.read_csv(
     CLINGEN_FILE,
     skiprows=4,
@@ -815,6 +1091,8 @@ print(
 # ============================================================
 # Load GenCC inheritance data
 # ============================================================
+
+ensure_gencc_file()
 
 gencc = pd.read_csv(
     GENCC_FILE,

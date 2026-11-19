@@ -42,6 +42,7 @@ variation_summary.txt
 variation_summary.txt.gz
 gencc_submissions.csv
 clingen_gene_disease_validity.csv
+gencc_download_metadata.json
 
 # ============================================================
 # Generated ClinVar data
