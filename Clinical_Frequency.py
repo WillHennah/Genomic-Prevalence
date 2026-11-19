@@ -21,9 +21,18 @@ INCLUDE_LIKELY_PATHOGENIC = False
 # Minimum gnomAD allele number required for a population estimate.
 MIN_POPULATION_AN = 10_000
 
-# Maximum AF allowed for the rare, highly penetrant disease model.
-# Variants at or above this frequency are retained for QC,
-# but excluded from prevalence calculations.
+# Maximum population AF compatible with the rare,
+# highly penetrant Mendelian prevalence model.
+#
+# This is intentionally a VARIANT-LEVEL GLOBAL criterion:
+# if a ClinVar Pathogenic variant reaches or exceeds this AF
+# in ANY sufficiently powered gnomAD population, exclude the
+# variant from prevalence calculations in ALL populations.
+#
+# The variant is retained in the evidence/QC tables so users
+# can assess whether its exclusion causes underestimation or
+# indicates incomplete penetrance, variable expressivity,
+# classification uncertainty, or incompatible inheritance.
 MAX_MODEL_ELIGIBLE_AF = 0.01
 
 EXCLUDED_POPULATION_IDS = {
@@ -82,13 +91,14 @@ STATUS_GNOMAD_NOT_FOUND = "gnomad_not_found"
 STATUS_INSUFFICIENT_AN = "insufficient_population_an"
 STATUS_EXCLUDED_COMMON = "excluded_common"
 STATUS_QUERY_FAILED = "query_failed"
+STATUS_NO_USABLE_VCF = "no_usable_grch38_vcf"
 
 # ============================================================
 # gnomAD cache settings
 # ============================================================
 
 # For development only. Later, set this to None for all variants.
-GNOMAD_TEST_LIMIT = 100
+GNOMAD_TEST_LIMIT = None
 
 GNOMAD_CACHE_FILE = "gnomad_cache.sqlite"
 GNOMAD_DATASET = "gnomad_r4"
@@ -127,6 +137,22 @@ X_LINKED_MODELS = {
     "x_linked_recessive",
     "x_linked_dominant",
     "x_linked_unspecified",
+}
+
+HWE_PREVALENCE_MODELS = {
+    "autosomal_recessive",
+    "autosomal_dominant",
+    "x_linked_recessive",
+    "x_linked_dominant",
+}
+
+HWE_CAUTION_MODELS = {
+    "x_linked_unspecified",
+    "semidominant",
+    "mitochondrial",
+    "digenic",
+    "y_linked",
+    "unknown",
 }
 
 # ------------------------------------------------------------
@@ -803,14 +829,205 @@ invalid_vcf_rows = pvars[
     ~valid_vcf_mask
 ].copy()
 
+# Preserve ClinVar evidence that cannot be represented as a
+# usable GRCh38 VCF variant and therefore cannot be queried
+# against gnomAD.
+invalid_vcf_evidence = (
+    invalid_vcf_rows[
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "VariationID",
+            "Disease_ID",
+            "MONDO_ID",
+            "Chromosome",
+            "PositionVCF",
+            "ReferenceAlleleVCF",
+            "AlternateAlleleVCF",
+            "ClinicalSignificance",
+        ]
+    ]
+    .copy()
+)
+
+invalid_vcf_evidence[
+    "evidence_status"
+] = STATUS_NO_USABLE_VCF
+
+invalid_vcf_evidence[
+    "evidence_reason"
+] = (
+    "ClinVar pathogenic record has no usable "
+    "GRCh38 VCF allele representation"
+)
+
+invalid_vcf_evidence[
+    "variant"
+] = (
+    "ClinVar:"
+    + invalid_vcf_evidence[
+        "VariationID"
+    ]
+    .astype("string")
+)
+
 print(
-    "\nClinVar relationships without a usable VCF allele:",
+    "\nClinVar rows without a usable VCF allele:",
     len(invalid_vcf_rows)
+)
+
+# ============================================================
+# Summarise complete ClinVar pathogenic evidence by disease
+# ============================================================
+
+clinvar_pathogenic_disease_summary = (
+    pvars
+    .groupby(
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        total_pathogenic_variants=(
+            "VariationID",
+            "nunique",
+        )
+    )
+)
+
+invalid_vcf_relationships = (
+    invalid_vcf_evidence[
+        [
+            "HGNC_ID",
+            "MONDO_ID",
+            "GeneSymbol",
+            "PhenotypeList",
+        ]
+    ]
+    .drop_duplicates()
+)
+
+print(
+    "Unique gene-disease relationships affected:",
+    len(invalid_vcf_relationships)
+)
+
+invalid_vcf_disease_summary = (
+    invalid_vcf_evidence
+    .groupby(
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        variants_without_usable_vcf=(
+            "VariationID",
+            "nunique",
+        )
+    )
 )
 
 pvars = pvars[
     valid_vcf_mask
 ].copy()
+
+usable_vcf_disease_summary = (
+    pvars
+    .groupby(
+        [
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        dropna=False,
+        as_index=False,
+    )
+    .agg(
+        variants_with_usable_vcf=(
+            "VariationID",
+            "nunique",
+        )
+    )
+)
+
+clinvar_evidence_completeness = (
+    clinvar_pathogenic_disease_summary
+    .merge(
+        usable_vcf_disease_summary,
+        on=[
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="1:1",
+    )
+    .merge(
+        invalid_vcf_disease_summary,
+        on=[
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="1:1",
+    )
+)
+
+for column in [
+    "variants_with_usable_vcf",
+    "variants_without_usable_vcf",
+]:
+    clinvar_evidence_completeness[column] = (
+        clinvar_evidence_completeness[column]
+        .fillna(0)
+        .astype(int)
+    )
+
+    clinvar_evidence_completeness[
+    "vcf_count_reconciles"
+] = (
+    clinvar_evidence_completeness[
+        "total_pathogenic_variants"
+    ]
+    == (
+        clinvar_evidence_completeness[
+            "variants_with_usable_vcf"
+        ]
+        + clinvar_evidence_completeness[
+            "variants_without_usable_vcf"
+        ]
+    )
+)
+
+print(
+    "\nGene-disease relationships with unreconciled "
+    "VCF evidence counts:",
+    (
+        ~clinvar_evidence_completeness[
+            "vcf_count_reconciles"
+        ]
+    ).sum()
+)
 
 pvars['variant'] = pvars['Chromosome'].astype(str) + '-' + pvars['PositionVCF'].astype(str) + '-' + pvars['ReferenceAlleleVCF'] + '-' + pvars['AlternateAlleleVCF']
 
@@ -3695,6 +3912,33 @@ autosomal_prevalence_results.loc[
     "multiple_inheritance_models",
 ] = False
 
+
+autosomal_prevalence_results = (
+    autosomal_prevalence_results
+    .merge(
+        invalid_vcf_disease_summary,
+        on=[
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="m:1",
+    )
+)
+
+autosomal_prevalence_results[
+    "variants_without_usable_vcf"
+] = (
+    autosomal_prevalence_results[
+        "variants_without_usable_vcf"
+    ]
+    .fillna(0)
+    .astype(int)
+)
+
 print("\nHOGA1 inheritance-aware prevalence example")
 print("------------------------------------------")
 
@@ -4162,6 +4406,32 @@ x_prevalence_results.loc[
     no_x_inheritance_evidence,
     "validity_variation",
 ] = False
+
+x_prevalence_results = (
+    x_prevalence_results
+    .merge(
+        invalid_vcf_disease_summary,
+        on=[
+            "GeneSymbol",
+            "HGNC_ID",
+            "PhenotypeList",
+            "Disease_ID",
+            "MONDO_ID",
+        ],
+        how="left",
+        validate="m:1",
+    )
+)
+
+x_prevalence_results[
+    "variants_without_usable_vcf"
+] = (
+    x_prevalence_results[
+        "variants_without_usable_vcf"
+    ]
+    .fillna(0)
+    .astype(int)
+)
 
 print("\nKDM5C inheritance-aware X-linked example")
 print("----------------------------------------")
