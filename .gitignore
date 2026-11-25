@@ -63,6 +63,7 @@ Gene_Based_Prevalences.csv
 gnomad_cache.sqlite
 gnomad_cache.sqlite-shm
 gnomad_cache.sqlite-wal
+gnomad_cache_backup.sqlite
 
 # ============================================================
 # Failed gnomAD query logs
@@ -72,6 +73,7 @@ failed_variants_retryable.log
 failed_variants_nonretryable.log
 gnomad_query_log_test.csv
 gnomad_frequency_test.csv
+clinical_frequency.log
 
 # ============================================================
 # Generated figures/reports

@@ -92,6 +92,9 @@ STATUS_INSUFFICIENT_AN = "insufficient_population_an"
 STATUS_EXCLUDED_COMMON = "excluded_common"
 STATUS_QUERY_FAILED = "query_failed"
 STATUS_NO_USABLE_VCF = "no_usable_grch38_vcf"
+SCRIPT_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
 
 # ============================================================
 # gnomAD cache settings
@@ -100,7 +103,10 @@ STATUS_NO_USABLE_VCF = "no_usable_grch38_vcf"
 # For development only. Later, set this to None for all variants.
 GNOMAD_TEST_LIMIT = None
 
-GNOMAD_CACHE_FILE = "gnomad_cache.sqlite"
+GNOMAD_CACHE_FILE = os.path.join(
+    SCRIPT_DIR,
+    "gnomad_cache.sqlite",
+)
 GNOMAD_DATASET = "gnomad_r4"
 
 # Refresh cached gnomAD results after this many days.
@@ -1140,7 +1146,6 @@ def combine_unique_values(series):
 
     return "|".join(sorted(values))
 
-
 def normalize_inheritance_model(label):
     """
     Normalize inheritance descriptions into model categories.
@@ -1185,7 +1190,6 @@ def normalize_inheritance_model(label):
         return "unknown"
 
     return "other"
-
 
 CLINGEN_MOI_LABELS = {
     "AR": "Autosomal recessive",
@@ -1973,7 +1977,9 @@ def initialise_gnomad_cache(cache_file=GNOMAD_CACHE_FILE):
       2. Raw population frequency rows from exomes and genomes.
     """
 
-    with sqlite3.connect(cache_file) as connection:
+    with connect_gnomad_cache(
+        cache_file=cache_file
+    ) as connection:
 
         connection.execute(
             """
@@ -2032,7 +2038,9 @@ def get_cached_status(
     has not previously completed successfully.
     """
 
-    with sqlite3.connect(cache_file) as connection:
+    with connect_gnomad_cache(
+        cache_file=cache_file
+    ) as connection:
 
         result = connection.execute(
             """
@@ -2065,7 +2073,9 @@ def load_cached_query_status(
     Load cached gnomAD query status information.
     """
 
-    with sqlite3.connect(cache_file) as connection:
+    with connect_gnomad_cache(
+        cache_file=cache_file
+    ) as connection:
 
         status_df = pd.read_sql_query(
             """
@@ -2082,15 +2092,65 @@ def load_cached_query_status(
         )
 
     if variant_ids is not None:
-        variant_ids = set(variant_ids)
+
+        variant_ids = set(
+            variant_ids
+        )
 
         status_df = status_df[
-            status_df["variant_id"].isin(
+            status_df[
+                "variant_id"
+            ].isin(
                 variant_ids
             )
         ].copy()
 
     return status_df
+
+def connect_gnomad_cache(
+    cache_file=GNOMAD_CACHE_FILE,
+    retries=5,
+    retry_delay=2,
+):
+    """
+    Open the persistent gnomAD SQLite cache with retries
+    for transient filesystem access failures.
+    """
+
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+
+        try:
+            connection = sqlite3.connect(
+                cache_file,
+                timeout=30,
+            )
+
+            connection.execute(
+                "PRAGMA busy_timeout = 30000"
+            )
+
+            return connection
+
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+
+            print(
+                f"[WARN] Could not open gnomAD cache "
+                f"(attempt {attempt}/{retries}): "
+                f"{exc}",
+                flush=True,
+            )
+
+            if attempt < retries:
+                time.sleep(retry_delay)
+
+    raise sqlite3.OperationalError(
+        f"Unable to open gnomAD cache after "
+        f"{retries} attempts: {cache_file}. "
+        f"Last error: {last_error}"
+    )
 
 def save_gnomad_result_to_cache(
     query_result,
@@ -2120,7 +2180,9 @@ def save_gnomad_result_to_cache(
         timezone.utc
     ).isoformat()
 
-    with sqlite3.connect(cache_file) as connection:
+    with connect_gnomad_cache(
+        cache_file=cache_file
+    ) as connection:
 
         try:
             connection.execute("BEGIN")
@@ -2230,7 +2292,9 @@ def load_cached_frequencies(
     If variant_ids is None, load every cached frequency row.
     """
 
-    with sqlite3.connect(cache_file) as connection:
+    with connect_gnomad_cache(
+        cache_file=cache_file
+    ) as connection:
 
         if variant_ids is None:
 
@@ -2608,6 +2672,7 @@ def select_gnomad_frequencies(
 
     return selected.reset_index(drop=True)
 
+
 # ============================================================
 # Query gnomAD with persistent SQLite caching
 # ============================================================
@@ -2653,21 +2718,6 @@ if GNOMAD_TEST_LIMIT is not None:
         )
     )
 
-# Check which X-linked development candidates are already cached.
-cached_x_status = load_cached_query_status(
-    variant_ids=(
-        x_test_candidates[
-            "variant"
-        ]
-        .dropna()
-        .astype("string")
-        .drop_duplicates()
-        .tolist()
-    )
-)
-
-
-
 print(
     f"Processing {len(variants_to_process):,} "
     "gnomAD variants."
@@ -2681,13 +2731,40 @@ success_count = 0
 not_found_count = 0
 failure_count = 0
 
+# ============================================================
+# Load existing gnomAD query statuses into memory
+# ============================================================
+
+cached_status_df = load_cached_query_status(
+    variant_ids=variants_to_process
+)
+
+cached_status_lookup = {}
+
+for row in cached_status_df.itertuples(
+    index=False
+):
+    cached_status_lookup[
+        row.variant_id
+    ] = {
+        "status": row.gnomad_query_status,
+        "error": row.gnomad_query_error,
+        "queried_at": row.queried_at,
+    }
+
+print(
+    "Cached gnomAD query statuses loaded:",
+    f"{len(cached_status_lookup):,}",
+    flush=True,
+)
+
 with requests.Session() as session:
     for number, variant_id in enumerate(
         variants_to_process,
         start=1,
     ):
-        cached_status = get_cached_status(
-            variant_id=variant_id
+        cached_status = cached_status_lookup.get(
+            variant_id
         )
 
         # Reuse completed cached outcomes.
@@ -2749,6 +2826,20 @@ with requests.Session() as session:
         )
 
         status = query_result["status"]
+
+        if was_cached:
+
+            cached_status_lookup[
+                variant_id
+            ] = {
+                "status": status,
+                "error": query_result.get(
+                    "error"
+                ),
+                "queried_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
 
         if status == "success":
             success_count += 1
